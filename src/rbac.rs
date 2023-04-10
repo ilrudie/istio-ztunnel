@@ -153,6 +153,9 @@ impl Authorization {
                     trace!(matches = rule_match, "rule");
                 }
                 group_match &= rule_match;
+                if !group_match {
+                    break;
+                }
             }
             trace!(matches = group_match, "group");
             if group_match {
@@ -482,22 +485,40 @@ mod tests {
     fn rbac_nesting() {
         let pol = allow_policy(
             "nested".to_string(),
-            vec![vec![
+            vec![
                 vec![
-                    RbacMatch {
-                        namespaces: vec![StringMatch::Exact("a".to_string())],
+                    vec![
+                        RbacMatch {
+                            namespaces: vec![StringMatch::Exact("c".to_string())],
+                            ..Default::default()
+                        },
+                        RbacMatch {
+                            namespaces: vec![StringMatch::Exact("d".to_string())],
+                            ..Default::default()
+                        },
+                    ],
+                    vec![RbacMatch {
+                        destination_ports: vec![81],
                         ..Default::default()
-                    },
-                    RbacMatch {
-                        namespaces: vec![StringMatch::Exact("b".to_string())],
-                        ..Default::default()
-                    },
+                    }],
                 ],
-                vec![RbacMatch {
-                    destination_ports: vec![80],
-                    ..Default::default()
-                }],
-            ]],
+                vec![
+                    vec![
+                        RbacMatch {
+                            namespaces: vec![StringMatch::Exact("a".to_string())],
+                            ..Default::default()
+                        },
+                        RbacMatch {
+                            namespaces: vec![StringMatch::Exact("b".to_string())],
+                            ..Default::default()
+                        },
+                    ],
+                    vec![RbacMatch {
+                        destination_ports: vec![80],
+                        ..Default::default()
+                    }],
+                ],
+            ],
         );
         // Can match either namespace...
         assert!(pol.matches(&Connection {
