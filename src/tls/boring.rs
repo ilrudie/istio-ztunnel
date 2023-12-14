@@ -310,6 +310,7 @@ pub fn grpc_connector(
     http.set_keepalive_interval(Some(Duration::from_secs(75)));
     http.set_keepalive_retries(Some(9));
     http.enforce_http(false);
+    http.set_connect_timeout(Some(Duration::from_millis(25)));
     let mut https: HttpsConnector<HttpConnector> =
         hyper_boring::HttpsConnector::with_connector(http, conn)?;
     https.set_callback(move |cc, _| {

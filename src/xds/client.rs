@@ -727,6 +727,7 @@ pub enum AdsError {
 
 #[cfg(test)]
 mod tests {
+    use core::panic;
     use std::{
         net::{IpAddr, Ipv4Addr},
         time::SystemTime,
@@ -737,11 +738,13 @@ mod tests {
     use textnonce::TextNonce;
     use tokio::time::sleep;
 
-    use crate::xds::istio::workload::address::Type as XdsType;
     use crate::xds::istio::workload::Address as XdsAddress;
     use crate::xds::istio::workload::Workload as XdsWorkload;
     use crate::xds::istio::workload::WorkloadType;
     use crate::xds::ADDRESS_TYPE;
+    use crate::{
+        test_helpers::xds::UnresponsiveAdsServer, xds::istio::workload::address::Type as XdsType,
+    };
     use workload::Workload;
 
     use crate::state::workload::NetworkAddress;
@@ -780,6 +783,32 @@ mod tests {
             sleep(POLL_RATE).await;
             let wl = source.fetch_workload(&ip_network_addr).await;
             matched = wl == converted; // Option<Workload> is Ok to compare without needing to unwrap
+        }
+    }
+
+    #[tokio::test]
+    async fn test_client_timeout() {
+        let ads_client = UnresponsiveAdsServer::spawn().await;
+
+        match tokio::time::timeout(tokio::time::Duration::from_millis(5000), ads_client.run()).await
+        {
+            Ok(result) => {
+                // we expect a timeout from the client here
+                match result {
+                    Ok(()) => {
+                        //this is still probably bad
+                        panic!("this shouldn't happen");
+                    }
+                    Err(_) => {
+                        //this is the right thing
+                        return;
+                    }
+                }
+            }
+            Err(e) => {
+                // fail, the test timed out before the client connect did!
+                panic!("we don't want this! {e}");
+            }
         }
     }
 

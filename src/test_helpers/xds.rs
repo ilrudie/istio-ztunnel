@@ -25,6 +25,7 @@ use hyper::server::conn::http2;
 use hyper_util::rt::TokioIo;
 use prometheus_client::registry::Registry;
 use tokio::sync::{mpsc, watch};
+use tokio::time::sleep;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Response, Status, Streaming};
 use tracing::{error, info, warn};
@@ -44,6 +45,58 @@ use crate::xds::service::discovery::v3::{
     DeltaDiscoveryRequest, DeltaDiscoveryResponse, DiscoveryRequest, DiscoveryResponse,
 };
 use crate::xds::{self, AdsClient, ProxyStateUpdater};
+
+pub struct UnresponsiveAdsServer {}
+
+impl UnresponsiveAdsServer {
+    pub async fn spawn() -> AdsClient {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("UnresponsiveAdsServer bind succeeds or tests fail");
+        let server_addr = listener
+            .local_addr()
+            .expect("UnresponsiveAdsServer has a valid address or tests fail");
+        tokio::spawn(async move {
+            while let Ok((stream, addr)) = listener.accept().await {
+                info!("connection received from {}", addr);
+                // just await readability forever, exit loop on an error
+                while let Ok(()) = stream.readable().await {
+                    sleep(Duration::from_millis(100)).await; // prevent runaway since the above readable() returns instanly
+                }
+            }
+        });
+
+        let certs = tls::generate_test_certs(
+            &server_addr.ip().into(),
+            Duration::from_secs(0),
+            Duration::from_secs(100),
+        );
+        let root_cert = RootCert::Static(certs.chain().unwrap());
+        let listener_addr_string = "https://".to_string() + &server_addr.to_string();
+        let cfg = test_config_with_port_xds_addr_and_root_cert(
+            80,
+            Some(listener_addr_string),
+            Some(root_cert),
+            None,
+        );
+
+        let mut registry = Registry::default();
+        let istio_registry = sub_registry(&mut registry);
+        let metrics = xds::metrics::Metrics::new(istio_registry);
+
+        let ready = Ready::new();
+
+        let tls_client_fetcher = Box::new(tls::FileClientCertProviderImpl::RootCert(
+            cfg.xds_root_cert.clone(),
+        ));
+        let ads_client = xds::Config::new(cfg, tls_client_fetcher)
+            .build(metrics, ready.register_task("ads client"));
+
+        ads_client
+    }
+}
+
+// impl AggregatedDiscoveryService for UnresponsiveAdsServer {}
 
 pub struct AdsServer {
     rx: watch::Receiver<Result<DeltaDiscoveryResponse, tonic::Status>>,
