@@ -20,7 +20,7 @@ use std::sync::Arc;
 use tracing::error;
 
 use crate::dns;
-use crate::drain::DrainWatcher;
+use crate::drain::{ConnectionDrain, DrainWatcher};
 
 use crate::proxy::connection_manager::ConnectionManager;
 use crate::proxy::{DefaultSocketFactory, Proxy, inbound::Inbound};
@@ -109,13 +109,16 @@ impl ProxyFactory {
             } else {
                 Arc::new(base)
             };
-        self.new_proxies_from_factory(None, proxy_workload_info, factory)
+        self.new_proxies_from_factory(None, None, proxy_workload_info, factory)
             .await
     }
 
     pub async fn new_proxies_from_factory(
         &self,
         proxy_drain: Option<DrainWatcher>,
+        // Drains just the inbound HBONE connections open at the time. See
+        // `Inbound::with_connection_drain`.
+        connection_drain: Option<ConnectionDrain>,
         proxy_workload_info: WorkloadInfo,
         socket_factory: Arc<dyn crate::proxy::SocketFactory + Send + Sync>,
     ) -> Result<ProxyResult, Error> {
@@ -168,7 +171,7 @@ impl ProxyFactory {
                 self.crl_manager.clone(),
             );
             result.connection_manager = Some(cm);
-            result.proxy = Some(Proxy::from_inputs(pi, drain).await?);
+            result.proxy = Some(Proxy::from_inputs(pi, drain, connection_drain).await?);
         }
 
         Ok(result)

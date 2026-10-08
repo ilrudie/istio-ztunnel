@@ -49,7 +49,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 use std::sync::{Arc, RwLock, RwLockReadGuard};
 use std::time::Duration;
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use self::workload::ApplicationTunnel;
 
@@ -76,8 +76,44 @@ impl DeprioritizedEndpoints {
         self.0.is_empty()
     }
 
-    fn contains(&self, uid: &Strng) -> bool {
+    pub fn contains(&self, uid: &Strng) -> bool {
         self.0.iter().any(|tried| tried == uid)
+    }
+}
+
+impl DeprioritizedEndpoints {
+    fn extend(&mut self, uids: impl IntoIterator<Item = Strng>) {
+        self.0.extend(uids);
+    }
+}
+
+/// How long an endpoint stays deprioritized after it showed it is draining. It only needs to outlast
+/// the gap until the control plane removes the endpoint, which is normally well under a second.
+const DRAINING_ENDPOINT_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Workloads that recently sent a GOAWAY on, or refused, an outbound HBONE connection, typically
+/// because they are terminating. Shared by every proxy on the node, so endpoint selection steers new
+/// connections, and retries, away from them before the control plane catches up. Keyed by UID, so
+/// a new workload that reuses a draining one's IP is not affected.
+#[derive(Debug, Default)]
+pub struct DrainingEndpoints(std::sync::Mutex<HashMap<Strng, std::time::Instant>>);
+
+impl DrainingEndpoints {
+    fn mark(&self, uid: Strng) {
+        self.0
+            .lock()
+            .expect("mutex")
+            .insert(uid, std::time::Instant::now());
+    }
+
+    /// The workloads still within their TTL. Drops the expired ones on the way.
+    fn current(&self) -> Vec<Strng> {
+        let mut draining = self.0.lock().expect("mutex");
+        if draining.is_empty() {
+            return Vec::new();
+        }
+        draining.retain(|_, marked| marked.elapsed() < DRAINING_ENDPOINT_TTL);
+        draining.keys().cloned().collect()
     }
 }
 
@@ -594,6 +630,9 @@ pub struct DemandProxyState {
 
     #[serde(skip_serializing)]
     dns_resolver: TokioResolver,
+
+    #[serde(skip_serializing)]
+    draining: Arc<DrainingEndpoints>,
 }
 
 impl DemandProxyState {
@@ -643,7 +682,27 @@ impl DemandProxyState {
             demand,
             dns_resolver,
             metrics,
+            draining: Default::default(),
         }
+    }
+
+    /// Deprioritizes the workload at `addr` in endpoint selection for a while, because it showed
+    /// it is draining: it sent a GOAWAY, or refused an HBONE connection. An address we don't know
+    /// (it may already be gone) is ignored.
+    pub fn mark_draining(&self, addr: &NetworkAddress, reason: &'static str) {
+        let Some(wl) = self.read().workloads.find_address(addr) else {
+            return;
+        };
+        info!(workload = %wl.uid, %addr, reason, "upstream is draining, deprioritizing endpoint");
+        self.draining.mark(wl.uid.clone());
+    }
+
+    /// The endpoints selection should avoid when it can: those that recently showed they are
+    /// draining.
+    pub fn draining_endpoints(&self) -> DeprioritizedEndpoints {
+        let mut deprioritized = DeprioritizedEndpoints::default();
+        deprioritized.extend(self.draining.current());
+        deprioritized
     }
 
     pub fn read(&self) -> RwLockReadGuard<'_, ProxyState> {
@@ -2283,6 +2342,20 @@ mod tests {
             10,
             "failover never selects missing ip",
         );
+    }
+
+    #[test]
+    fn draining_endpoints_expire() {
+        let draining = DrainingEndpoints::default();
+        assert!(draining.current().is_empty());
+        draining.mark(strng::new("fresh"));
+        draining.0.lock().unwrap().insert(
+            strng::new("stale"),
+            std::time::Instant::now() - DRAINING_ENDPOINT_TTL,
+        );
+        assert_eq!(draining.current(), vec![strng::new("fresh")]);
+        // Expired entries are dropped, not just skipped.
+        assert_eq!(draining.0.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

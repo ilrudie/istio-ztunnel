@@ -11,8 +11,17 @@ enum Version {
   V1 = 1;
 }
 
+// Optional protocol features. ztunnel lists the ones it supports in ZdsHello; the CNI agent
+// must not send a message a feature introduces unless ztunnel advertised that feature.
+enum Capability {
+  CAPABILITY_UNSPECIFIED = 0;
+  // ztunnel understands DrainWorkload.
+  DRAIN_WORKLOAD = 1;
+}
+
 message ZdsHello {
   Version version = 1;
+  repeated Capability capabilities = 2;
 }
 
 message WorkloadInfo {
@@ -23,7 +32,7 @@ message WorkloadInfo {
   string service_account = 3;
 }
 
-// Add a workload to the ztunnel. this will be accompanied by ancillary data contianing
+// Add a workload to the ztunnel. This will be accompanied by ancillary data containing
 // the workload's netns file descriptor.
 message AddWorkload {
   string uid = 1;
@@ -39,6 +48,20 @@ message KeepWorkload {
 // Delete a workload from the ztunnel. Ztunnel should shutdown the workload's proxy.
 message DelWorkload {
   string uid = 2;
+}
+
+// Drain a workload's inbound HBONE traffic, typically because it is terminating. Ztunnel sends a
+// graceful GOAWAY on every inbound HBONE connection to the workload, both those open when the
+// message arrives and any accepted afterwards. Streams already running keep running; any new stream
+// (CONNECT) is reset with REFUSED_STREAM, so the peer can retry it elsewhere. New HBONE connections
+// are still accepted, so peers learn the workload is draining from the GOAWAY rather than from a
+// TCP refusal. The workload's outbound traffic and DNS are unaffected. Only sent if ztunnel
+// advertised the DRAIN_WORKLOAD capability.
+//
+// Idempotent. A uid ztunnel does not know (or has not started a proxy for yet) has no connections
+// to drain, and is not an error.
+message DrainWorkload {
+  string uid = 1;
 }
 
 // Let ztunnel know that a full snapshot was sent. Ztunnel should reconcile its internal state
@@ -59,7 +82,9 @@ on new connection from ztunnel to CNI, the CNI agent
 - when the CNI finishes sending the content of its current cache, a SnapshotSent message will be sent.
 - the ztunnel will then remove any entries from its cache that were not sent up to this point (as these entries do not exist in the CNI
   cache, and must have been deleted). ztunnel will ack the SnapshotSent message.
-- from now on, ztunnel will expect only AddWorkload and DelWorkload messages.
+- from now on, ztunnel will expect only AddWorkload, DrainWorkload and DelWorkload messages.
+- the CNI may send DrainWorkload for a workload (if ztunnel advertised DRAIN_WORKLOAD), for
+  example when it starts terminating, and later sends DelWorkload once the workload is gone.
 */
 
 // Sent from CNI to ztunnel
@@ -69,6 +94,7 @@ message WorkloadRequest {
     KeepWorkload keep = 5;
     DelWorkload del = 2;
     SnapshotSent snapshot_sent = 3;
+    DrainWorkload drain = 6;
   }
 }
 

@@ -31,7 +31,7 @@ use crate::baggage::{baggage_header_val, parse_baggage_header};
 use crate::identity::Identity;
 
 use crate::config::Config;
-use crate::drain::DrainWatcher;
+use crate::drain::{ConnectionDrain, DrainWatcher};
 use crate::proxy::h2::server::{H2Request, RequestParts};
 use crate::proxy::metrics::{ConnectionOpen, Reporter};
 use crate::proxy::{
@@ -55,6 +55,8 @@ use crate::tls::TlsError;
 pub struct Inbound {
     listener: socket::Listener,
     drain: DrainWatcher,
+    /// Drains the HBONE connections open at the time. See [`Self::with_connection_drain`].
+    connection_drain: Option<ConnectionDrain>,
     pi: Arc<ProxyInputs>,
     enable_orig_src: bool,
 }
@@ -76,9 +78,19 @@ impl Inbound {
         Ok(Inbound {
             listener,
             drain,
+            connection_drain: None,
             pi,
             enable_orig_src,
         })
+    }
+
+    /// Lets `connection_drain` drain this listener's HBONE connections: each one, including any
+    /// accepted after the drain, sends a graceful GOAWAY, lets its existing streams finish, and
+    /// refuses new ones. The listener keeps accepting, so a peer that connects after the drain gets
+    /// the GOAWAY (and steers away from this endpoint) instead of a TCP refusal.
+    pub fn with_connection_drain(mut self, connection_drain: ConnectionDrain) -> Self {
+        self.connection_drain = Some(connection_drain);
+        self
     }
 
     /// Returns the socket address this proxy is listening on.
@@ -111,6 +123,8 @@ impl Inbound {
                 let src = to_canonical(src);
                 let start = Instant::now();
                 let drain = drain.clone();
+                // Subscribe on accept, so a drain that arrives during the handshakes still applies.
+                let connection_drain = self.connection_drain.as_ref().map(|d| d.subscribe());
                 let force_shutdown = force_shutdown.clone();
                 let pi = self.pi.clone();
                 let dst = to_canonical(raw_socket.local_addr().expect("local_addr available"));
@@ -174,6 +188,7 @@ impl Inbound {
                         drain,
                         force_shutdown,
                         revocation,
+                        connection_drain,
                         request_handler,
                     );
                     // This is per HBONE connection, so while would be nice to be small, at least it
@@ -183,7 +198,7 @@ impl Inbound {
                 };
                 // This is small since it only handles the TLS layer -- the HTTP2 layer is boxed
                 // and measured above.
-                assertions::size_between_ref(1000, 1650, &serve_client);
+                assertions::size_between_ref(1000, 1700, &serve_client);
                 tokio::task::spawn(serve_client.in_current_span());
             }
         };

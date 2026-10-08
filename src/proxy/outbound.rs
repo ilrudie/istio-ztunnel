@@ -211,7 +211,10 @@ impl OutboundConnection {
     /// - `Identity` and `WorkloadHBONEPoolDraining`, which fail identically against every
     ///   endpoint: the first is a local certificate fetch, the second is our own shutdown.
     /// - `HttpStatus`, where the peer answered and refused. This carries RBAC denials, and a
-    ///   policy decision does not change on retry.
+    ///   policy decision does not change on retry. The exception is a 503: the destination ztunnel
+    ///   answers that when it cannot reach the application, typically because the pod is shutting
+    ///   down and the app already exited. It is the CONNECT response, so nothing reached the
+    ///   application and another endpoint can take the connection.
     /// - `CertificateRevoked`, which is a deliberate security outcome.
     ///
     /// `MaybeHBONENetworkPolicyError` is retried even though its usual cause, a NetworkPolicy
@@ -237,6 +240,7 @@ impl OutboundConnection {
                 | Error::H2(_)
                 | Error::HandshakeTimeout(_)
                 | Error::MaybeHBONENetworkPolicyError(_)
+                | Error::HttpStatus(http::StatusCode::SERVICE_UNAVAILABLE)
         )
     }
 
@@ -334,7 +338,9 @@ impl OutboundConnection {
         let mut retries = 0;
         // Endpoints a previous attempt already failed on. Endpoint selection prefers anything
         // else, so a retry does not just re-roll the dice onto the same dead endpoint.
-        let mut deprioritized = DeprioritizedEndpoints::default();
+        // Seeded with the endpoints that recently showed they are draining, so even the first
+        // attempt avoids them when it can.
+        let mut deprioritized = self.pi.state.draining_endpoints();
         loop {
             // First find the source workload of this traffic. If we don't know where the request is from
             // we will reject it.
@@ -2788,6 +2794,11 @@ mod tests {
         // change.
         assert!(!retriable(&Error::HttpStatus(
             http::StatusCode::UNAUTHORIZED
+        )));
+        // Except a 503 to the CONNECT: the destination could not reach its application (it is
+        // likely shutting down), and nothing was sent to it, so another endpoint can serve this.
+        assert!(retriable(&Error::HttpStatus(
+            http::StatusCode::SERVICE_UNAVAILABLE
         )));
         // A deliberate security outcome, not a flaky endpoint.
         assert!(!retriable(&Error::CertificateRevoked));

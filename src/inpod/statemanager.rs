@@ -30,6 +30,8 @@ use super::netns::{InpodNetns, NetnsID};
 // Note: we can't drain on drop, as drain is async (it waits for the drain to finish).
 pub(super) struct WorkloadState {
     drain: DrainTrigger,
+    /// Drains the inbound HBONE connections open at the time, on a DrainWorkload.
+    connection_drain: drain::ConnectionDrain,
     netns_id: NetnsID,
 }
 
@@ -167,6 +169,24 @@ impl WorkloadProxyManagerState {
                 self.snapshot_names.insert(workload_uid);
                 Ok(())
             }
+            WorkloadMessage::DrainWorkload(workload_uid) => {
+                match self.workload_states.get(&workload_uid) {
+                    Some(workload_state) => {
+                        info!(
+                            uid = workload_uid.0,
+                            "pod drain request, sending GOAWAY on inbound HBONE connections and refusing new streams"
+                        );
+                        workload_state.connection_drain.drain();
+                    }
+                    // Not an error: a workload whose proxy has not started (or that is already
+                    // gone) has no connections to drain.
+                    None => debug!(
+                        uid = workload_uid.0,
+                        "pod drain request for workload without a running proxy, ignoring"
+                    ),
+                }
+                Ok(())
+            }
             WorkloadMessage::DelWorkload(workload_uid) => {
                 info!(
                     uid = workload_uid.0,
@@ -290,11 +310,13 @@ impl WorkloadProxyManagerState {
         // We create a per workload drain here. If the main loop in WorkloadProxyManager::run drains,
         // we drain all these per-workload drains before exiting the loop
         let (drain_tx, drain_rx) = drain::new();
+        let connection_drain = drain::ConnectionDrain::default();
 
         let proxies = self
             .proxy_gen
             .new_proxies_from_factory(
                 Some(drain_rx),
+                Some(connection_drain.clone()),
                 workload_info.clone(),
                 Arc::from(self.inpod_config.socket_factory(netns)),
             )
@@ -328,6 +350,7 @@ impl WorkloadProxyManagerState {
             workload_uid.clone(),
             WorkloadState {
                 drain: drain_tx,
+                connection_drain,
                 netns_id: workload_netns_id,
             },
         );
@@ -723,5 +746,59 @@ mod tests {
         let add = WorkloadMessage::AddWorkload(data);
 
         assert_matches!(state.process_msg(add).await, Err(_));
+    }
+
+    #[tokio::test]
+    async fn drain_workload_signals_open_connections() {
+        let fixture = fixture!();
+        let mut state = fixture.state;
+        state
+            .process_msg(WorkloadMessage::AddWorkload(WorkloadData {
+                netns: new_netns(),
+                workload_uid: uid(0),
+                workload_info: workload_info(),
+            }))
+            .await
+            .unwrap();
+        // Stands in for an inbound HBONE connection the proxy accepted.
+        let open_conn = state.workload_states()[&uid(0)]
+            .connection_drain
+            .subscribe();
+        assert!(!open_conn.has_changed().unwrap());
+
+        state
+            .process_msg(WorkloadMessage::DrainWorkload(uid(0)))
+            .await
+            .unwrap();
+        assert!(open_conn.has_changed().unwrap());
+        // A connection accepted after the drain is drained too.
+        let later_conn = state.workload_states()[&uid(0)]
+            .connection_drain
+            .subscribe();
+        assert!(later_conn.has_changed().unwrap());
+        // The proxy keeps running: new connections are still accepted.
+        assert_eq!(fixture.metrics.active_proxy_count.get(), 1);
+        assert!(state.workload_states().contains_key(&uid(0)));
+        state.drain().await;
+    }
+
+    #[tokio::test]
+    async fn drain_workload_without_a_proxy_is_ignored() {
+        let fixture = fixture!();
+        let mut state = fixture.state;
+        state
+            .process_msg(WorkloadMessage::DrainWorkload(uid(0)))
+            .await
+            .unwrap();
+        state
+            .process_msg(WorkloadMessage::WorkloadSnapshotSent)
+            .await
+            .unwrap();
+        state
+            .process_msg(WorkloadMessage::DrainWorkload(uid(1)))
+            .await
+            .unwrap();
+        assert!(state.workload_states().is_empty());
+        state.drain().await;
     }
 }

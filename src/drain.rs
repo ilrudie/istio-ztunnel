@@ -31,6 +31,59 @@ pub fn new() -> (DrainTrigger, DrainWatcher) {
     (tx, rx)
 }
 
+/// Drains a workload's inbound HBONE connections, typically because it is terminating. Every
+/// connection, whether open at the drain or accepted after it, sends a graceful GOAWAY and refuses
+/// new streams, while the streams it already has keep running. The listener keeps accepting, so a
+/// peer's new connection succeeds and learns from the GOAWAY that this endpoint is draining.
+/// Cloning shares the signal.
+#[derive(Clone, Debug, Default)]
+pub struct ConnectionDrain(std::sync::Arc<ConnectionDrainInner>);
+
+#[derive(Debug)]
+struct ConnectionDrainInner {
+    signal: watch::Sender<()>,
+    drained: std::sync::atomic::AtomicBool,
+}
+
+impl Default for ConnectionDrainInner {
+    fn default() -> Self {
+        Self {
+            signal: watch::channel(()).0,
+            drained: Default::default(),
+        }
+    }
+}
+
+impl ConnectionDrain {
+    /// Drains every connection, including those accepted from now on.
+    pub fn drain(&self) {
+        self.0
+            .drained
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.0.signal.send_replace(());
+    }
+
+    /// Called when a connection is accepted. If the workload is already drained, the receiver
+    /// fires right away.
+    pub fn subscribe(&self) -> watch::Receiver<()> {
+        let mut rx = self.0.signal.subscribe();
+        if self.0.drained.load(std::sync::atomic::Ordering::SeqCst) {
+            rx.mark_changed();
+        }
+        rx
+    }
+}
+
+/// Resolves once `drain` signals a drain. Never resolves for `None`, or once the signal is gone.
+pub async fn wait_for_connection_drain(drain: Option<&mut watch::Receiver<()>>) {
+    if let Some(drain) = drain
+        && drain.changed().await.is_ok()
+    {
+        return;
+    }
+    std::future::pending().await
+}
+
 /// run_with_drain provides a wrapper to run a future with graceful shutdown/draining support.
 /// A caller should construct a future with takes two arguments:
 /// * drain: while holding onto this, the future is marked as active, which will block the server from shutting down.

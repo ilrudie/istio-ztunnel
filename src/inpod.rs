@@ -80,6 +80,7 @@ pub enum WorkloadMessage {
     AddWorkload(WorkloadData),
     KeepWorkload(WorkloadUid),
     WorkloadSnapshotSent,
+    DrainWorkload(WorkloadUid),
     DelWorkload(WorkloadUid),
 }
 

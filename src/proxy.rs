@@ -35,7 +35,7 @@ pub use metrics::*;
 use crate::identity::{Identity, SecretManager};
 
 use crate::dns::resolver::Resolver;
-use crate::drain::DrainWatcher;
+use crate::drain::{ConnectionDrain, DrainWatcher};
 use crate::proxy::connection_manager::{ConnectionManager, PolicyWatcher};
 use crate::proxy::inbound_passthrough::InboundPassthrough;
 use crate::proxy::outbound::Outbound;
@@ -192,6 +192,10 @@ impl LocalWorkloadInformation {
         }
     }
 
+    pub fn state(&self) -> &DemandProxyState {
+        &self.state
+    }
+
     pub async fn get_workload(&self) -> Result<Arc<Workload>, Error> {
         get_workload(&self.state, self.wi.clone()).await
     }
@@ -294,9 +298,13 @@ impl Proxy {
     pub(super) async fn from_inputs(
         mut pi: Arc<ProxyInputs>,
         drain: DrainWatcher,
+        connection_drain: Option<ConnectionDrain>,
     ) -> Result<Self, Error> {
         // We setup all the listeners first so we can capture any errors that should block startup
-        let inbound = Inbound::new(pi.clone(), drain.clone()).await?;
+        let mut inbound = Inbound::new(pi.clone(), drain.clone()).await?;
+        if let Some(connection_drain) = connection_drain {
+            inbound = inbound.with_connection_drain(connection_drain);
+        }
 
         // This exists for `direct` integ tests, no other reason
         #[cfg(any(test, feature = "testing"))]

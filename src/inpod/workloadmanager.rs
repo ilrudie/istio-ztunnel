@@ -457,7 +457,12 @@ pub(crate) mod tests {
         let mut state = f.state;
 
         let server = tokio::spawn(async move {
-            read_hello(&mut s2).await;
+            let hello = read_hello(&mut s2).await;
+            // The CNI agent only sends DrainWorkload to a ztunnel that advertises it.
+            assert_eq!(
+                hello.capabilities().collect::<Vec<_>>(),
+                [crate::inpod::istio::zds::Capability::DrainWorkload]
+            );
             send_workload_added(&mut s2, uid(0), workload_info(), new_netns()).await;
             read_msg(&mut s2).await;
         });

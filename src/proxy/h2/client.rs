@@ -25,6 +25,7 @@ use std::fmt;
 use std::fmt::{Display, Formatter};
 use std::net::IpAddr;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::task::{Context, Poll};
@@ -262,4 +263,187 @@ async fn drive_connection<S, B>(
     }
     // Signal to the ping_pong it should also stop.
     dropped.store(true, Ordering::Relaxed);
+}
+
+/// Wraps the I/O of an outbound HBONE connection and calls `on_goaway` once, as soon as the peer
+/// sends a GOAWAY frame.
+///
+/// The h2 client only reports a GOAWAY through `SendRequest::poll_ready`, and holding a
+/// `SendRequest` just to poll it would keep the connection open forever. So this follows the frame
+/// headers in the bytes the peer sends instead: the server side of an HTTP/2 connection starts
+/// directly with a frame (its preface is a SETTINGS frame), and every frame starts with a 9-byte
+/// header carrying its payload length and type.
+pub struct GoAwayWatcher<S> {
+    inner: S,
+    on_goaway: Option<Box<dyn FnOnce() + Send>>,
+    /// Bytes of the current frame header read so far.
+    header: [u8; FRAME_HEADER_LEN],
+    header_len: usize,
+    /// Payload bytes of the current frame still to skip.
+    payload_left: usize,
+}
+
+const FRAME_HEADER_LEN: usize = 9;
+const FRAME_TYPE_GOAWAY: u8 = 0x7;
+
+impl<S> GoAwayWatcher<S> {
+    pub fn new(inner: S, on_goaway: impl FnOnce() + Send + 'static) -> Self {
+        Self {
+            inner,
+            on_goaway: Some(Box::new(on_goaway)),
+            header: [0; FRAME_HEADER_LEN],
+            header_len: 0,
+            payload_left: 0,
+        }
+    }
+
+    fn observe(&mut self, mut data: &[u8]) {
+        while !data.is_empty() && self.on_goaway.is_some() {
+            if self.payload_left > 0 {
+                let skip = self.payload_left.min(data.len());
+                self.payload_left -= skip;
+                data = &data[skip..];
+                continue;
+            }
+            let take = (FRAME_HEADER_LEN - self.header_len).min(data.len());
+            self.header[self.header_len..self.header_len + take].copy_from_slice(&data[..take]);
+            self.header_len += take;
+            data = &data[take..];
+            if self.header_len < FRAME_HEADER_LEN {
+                return;
+            }
+            self.header_len = 0;
+            self.payload_left =
+                u32::from_be_bytes([0, self.header[0], self.header[1], self.header[2]]) as usize;
+            if self.header[3] == FRAME_TYPE_GOAWAY
+                && let Some(on_goaway) = self.on_goaway.take()
+            {
+                on_goaway();
+            }
+        }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for GoAwayWatcher<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let res = Pin::new(&mut this.inner).poll_read(cx, buf);
+        if this.on_goaway.is_some() {
+            let filled = buf.filled();
+            // Copied out only because `observe` needs `&mut self`; this is cheap next to the read.
+            let new = filled[before..].to_vec();
+            this.observe(&new);
+        }
+        res
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for GoAwayWatcher<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    fn frame(kind: u8, payload: &[u8]) -> Vec<u8> {
+        let len = (payload.len() as u32).to_be_bytes();
+        let mut f = vec![len[1], len[2], len[3], kind, 0, 0, 0, 0, 0];
+        f.extend_from_slice(payload);
+        f
+    }
+
+    fn watcher(fired: &Arc<AtomicUsize>) -> GoAwayWatcher<tokio::io::Empty> {
+        let fired = fired.clone();
+        GoAwayWatcher::new(tokio::io::empty(), move || {
+            fired.fetch_add(1, Ordering::SeqCst);
+        })
+    }
+
+    #[test]
+    fn goaway_watcher_finds_goaway_across_any_read_boundary() {
+        // A GOAWAY type byte inside a DATA payload must not count: only frame headers do.
+        let mut bytes = frame(0x4, &[0; 6]); // SETTINGS
+        bytes.extend(frame(0x0, &[FRAME_TYPE_GOAWAY; 20])); // DATA
+        let before_goaway = bytes.len();
+        bytes.extend(frame(FRAME_TYPE_GOAWAY, &[0; 8]));
+        bytes.extend(frame(FRAME_TYPE_GOAWAY, &[0; 8]));
+
+        for chunk in 1..=bytes.len() {
+            let fired = Arc::new(AtomicUsize::new(0));
+            let mut w = watcher(&fired);
+            let mut seen = 0;
+            for piece in bytes.chunks(chunk) {
+                w.observe(piece);
+                seen += piece.len();
+                let expected = usize::from(seen >= before_goaway + FRAME_HEADER_LEN);
+                assert_eq!(
+                    fired.load(Ordering::SeqCst),
+                    expected,
+                    "chunk size {chunk}, at {seen}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn goaway_watcher_sees_a_graceful_shutdown() {
+        let (client_io, server_io) = tokio::io::duplex(1 << 16);
+        let fired = Arc::new(AtomicUsize::new(0));
+        let server = tokio::spawn(async move {
+            let mut conn = h2::server::handshake(server_io).await.unwrap();
+            conn.graceful_shutdown();
+            while conn.accept().await.is_some() {}
+        });
+        let client_io = GoAwayWatcher::new(client_io, {
+            let fired = fired.clone();
+            move || {
+                fired.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        let noticed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (_send, conn) = h2::client::handshake(client_io).await.unwrap();
+            let client = tokio::spawn(conn);
+            while fired.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            client.abort();
+        })
+        .await;
+        server.abort();
+        assert!(noticed.is_ok(), "GOAWAY should be noticed");
+        assert_eq!(fired.load(Ordering::SeqCst), 1);
+    }
 }

@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::istio::zds::{self, Ack, Version, WorkloadRequest, WorkloadResponse, ZdsHello};
+use super::istio::zds::{
+    self, Ack, Capability, Version, WorkloadRequest, WorkloadResponse, ZdsHello,
+};
 use super::{WorkloadData, WorkloadMessage};
 use crate::drain::DrainWatcher;
 use nix::sys::socket::{ControlMessageOwned, MsgFlags, recvmsg, sendmsg};
@@ -40,6 +42,7 @@ impl WorkloadStreamProcessor {
     pub async fn send_hello(&mut self) -> std::io::Result<()> {
         let r = ZdsHello {
             version: Version::V1 as i32,
+            capabilities: vec![Capability::DrainWorkload as i32],
         };
         self.send_msg(r).await
     }
@@ -168,6 +171,9 @@ fn get_workload_data(
             k.uid,
         ))),
         (Payload::Del(d), None) => Ok(WorkloadMessage::DelWorkload(super::WorkloadUid::new(d.uid))),
+        (Payload::Drain(d), None) => Ok(WorkloadMessage::DrainWorkload(super::WorkloadUid::new(
+            d.uid,
+        ))),
         (Payload::SnapshotSent(_), None) => Ok(WorkloadMessage::WorkloadSnapshotSent),
     }
 }
@@ -333,5 +339,33 @@ mod tests {
 
         let res = get_workload_data(&data[..], None, flags).unwrap();
         assert!(matches!(res, WorkloadMessage::DelWorkload(_)));
+    }
+
+    #[test]
+    fn test_parse_drain_workload() {
+        let flags = MsgFlags::empty();
+        let uid = uid(0);
+        let data = prep_request(zds::workload_request::Payload::Drain(
+            istio::zds::DrainWorkload {
+                uid: uid.clone().into_string(),
+            },
+        ));
+
+        let res = get_workload_data(&data[..], None, flags).unwrap();
+        assert!(matches!(res, WorkloadMessage::DrainWorkload(u) if u == uid));
+    }
+
+    #[test]
+    fn test_parse_drain_workload_with_fds_fails() {
+        let owned_fd: OwnedFd = std::fs::File::open("/dev/null").unwrap().into();
+        let flags = MsgFlags::empty();
+        let data = prep_request(zds::workload_request::Payload::Drain(
+            istio::zds::DrainWorkload {
+                uid: uid(0).into_string(),
+            },
+        ));
+
+        let res = get_workload_data(&data[..], Some(owned_fd), flags);
+        assert!(res.is_err());
     }
 }
