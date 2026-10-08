@@ -2,3 +2,6 @@ out/
 var/
 .idea/
 .vscode/
+
+# Core dumps
+core.*
