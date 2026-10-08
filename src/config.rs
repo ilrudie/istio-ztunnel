@@ -76,6 +76,8 @@ const POOL_UNUSED_RELEASE_TIMEOUT: &str = "POOL_UNUSED_RELEASE_TIMEOUT";
 const OUTBOUND_CONNECT_MAX_RETRIES: &str = "OUTBOUND_CONNECT_MAX_RETRIES";
 const OUTBOUND_CONNECT_BASE_BACKOFF: &str = "OUTBOUND_CONNECT_BASE_BACKOFF";
 const OUTBOUND_CONNECT_MAX_BACKOFF: &str = "OUTBOUND_CONNECT_MAX_BACKOFF";
+const DRAINING_ENDPOINT_TTL: &str = "DRAINING_ENDPOINT_TTL";
+const ENABLE_HBONE_GOAWAY_STEERING: &str = "ENABLE_HBONE_GOAWAY_STEERING";
 // CONNECTION_TERMINATION_DEADLINE configures an explicit deadline
 const CONNECTION_TERMINATION_DEADLINE: &str = "CONNECTION_TERMINATION_DEADLINE";
 // TERMINATION_GRACE_PERIOD_SECONDS configures the Kubernetes terminationGracePeriodSeconds configuration.
@@ -112,6 +114,9 @@ const DEFAULT_POOL_MAX_STREAMS_PER_CONNECTION: u16 = 100; //Go: 100, Hyper: 200,
 const DEFAULT_OUTBOUND_CONNECT_MAX_RETRIES: usize = 0;
 const DEFAULT_OUTBOUND_CONNECT_BASE_BACKOFF: Duration = Duration::from_millis(10);
 const DEFAULT_OUTBOUND_CONNECT_MAX_BACKOFF: Duration = Duration::from_millis(500);
+// Only needs to outlast the gap until the control plane removes a terminating endpoint, which is
+// normally well under a second.
+const DEFAULT_DRAINING_ENDPOINT_TTL: Duration = Duration::from_secs(10);
 
 const DEFAULT_INPOD_MARK: u32 = 1337;
 
@@ -241,6 +246,13 @@ pub struct Config {
     pub outbound_connect_base_backoff: Duration,
     /// Upper bound on the delay between outbound connect retries.
     pub outbound_connect_max_backoff: Duration,
+    /// How long endpoint selection avoids a workload after it showed it is draining, by sending a
+    /// GOAWAY or refusing a CONNECT.
+    pub draining_endpoint_ttl: Duration,
+    /// Whether a GOAWAY received on an outbound HBONE connection marks the peer workload as
+    /// draining. The GOAWAY is found by following HTTP/2 frame headers in the decrypted stream,
+    /// since h2 has no API for it; this is the kill switch for that.
+    pub enable_hbone_goaway_steering: bool,
 
     pub socks5_addr: Option<SocketAddr>,
     pub admin_addr: Address,
@@ -824,6 +836,11 @@ pub fn construct_config(pc: ProxyConfig) -> Result<Config, Error> {
             OUTBOUND_CONNECT_MAX_BACKOFF,
             DEFAULT_OUTBOUND_CONNECT_MAX_BACKOFF,
         )?,
+        draining_endpoint_ttl: parse_duration_default(
+            DRAINING_ENDPOINT_TTL,
+            DEFAULT_DRAINING_ENDPOINT_TTL,
+        )?,
+        enable_hbone_goaway_steering: parse_default(ENABLE_HBONE_GOAWAY_STEERING, true)?,
 
         // window size: per-stream limit
         window_size: parse_default(HTTP2_STREAM_WINDOW_SIZE, 4 * 1024 * 1024)?,

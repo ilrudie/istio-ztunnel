@@ -103,19 +103,6 @@ impl ConnSpawner {
                 .await
                 .map_err(|e: io::Error| match e.kind() {
                     io::ErrorKind::TimedOut => Error::MaybeHBONENetworkPolicyError(e),
-                    io::ErrorKind::ConnectionRefused => {
-                        // A refused HBONE port means the endpoint stopped accepting, typically
-                        // because it is draining. Steer every connection on the node away from
-                        // it, not just this connect's retries.
-                        self.local_workload.state().mark_draining(
-                            &crate::state::workload::network_addr(
-                                self.cfg.network.clone(),
-                                key.dst.ip(),
-                            ),
-                            "refused HBONE connection",
-                        );
-                        e.into()
-                    }
                     _ => e.into(),
                 })?;
 
@@ -151,16 +138,22 @@ impl ConnSpawner {
             super::HandshakeStage::Http2,
             h2::client::spawn_connection(
                 self.cfg.clone(),
-                // A GOAWAY means the endpoint is draining (or its ztunnel is shutting down), so steer
-                // new connections away from it, not just off this one.
-                h2::client::GoAwayWatcher::new(tls_stream, {
-                    let state = self.local_workload.state().clone();
-                    let addr = crate::state::workload::network_addr(
-                        self.cfg.network.clone(),
-                        key.dst.ip(),
-                    );
-                    move || state.mark_draining(&addr, "sent GOAWAY")
-                }),
+                // A GOAWAY means the endpoint is draining, so steer new connections away from it,
+                // not just off this one. A peer ztunnel that is itself shutting down sends one too;
+                // that only shifts load off its node for a while, since selection still falls back
+                // to its endpoints.
+                if self.cfg.enable_hbone_goaway_steering {
+                    h2::client::GoAwayWatcher::new(tls_stream, {
+                        let state = self.local_workload.state().clone();
+                        let addr = crate::state::workload::network_addr(
+                            self.cfg.network.clone(),
+                            key.dst.ip(),
+                        );
+                        move || state.mark_draining(&addr, "sent GOAWAY")
+                    })
+                } else {
+                    h2::client::GoAwayWatcher::disabled(tls_stream)
+                },
                 self.timeout_rx.clone(),
                 key,
                 revocation,
@@ -796,48 +789,12 @@ mod test {
         assert_opens_drops!(srv, 2, 0);
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn refused_connect_marks_endpoint_draining() {
-        let (mut pool, _srv) = setup_test(3).await;
-        // Bind to grab a free port, then drop the listener so the connect is refused. The
-        // workload "uid" lives at 127.0.0.1.
-        let addr = {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            listener.local_addr().unwrap()
-        };
-        assert!(!is_draining(&pool, "uid"));
-
-        let (err, _) = send_with_deadline(&mut pool, addr).await;
-        assert!(
-            matches!(&err, Error::Io(e) if e.kind() == io::ErrorKind::ConnectionRefused),
-            "got {err:?}"
-        );
-        assert!(is_draining(&pool, "uid"));
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn stalled_connect_does_not_mark_endpoint_draining() {
-        let (mut pool, _srv) = setup_test(3).await;
-        // Accepts TCP and then stalls: slow, not draining.
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let mut held = Vec::new();
-            while let Ok((stream, _)) = listener.accept().await {
-                held.push(stream);
-            }
-        });
-
-        send_with_deadline(&mut pool, addr).await;
-        assert!(!is_draining(&pool, "uid"));
-    }
-
     fn is_draining(pool: &WorkloadHBONEPool, uid: &str) -> bool {
         pool.state
             .spawner
             .local_workload
             .state()
-            .draining_endpoints()
+            .draining_endpoints(Duration::from_secs(10))
             .contains(&uid.into())
     }
 

@@ -288,9 +288,18 @@ const FRAME_TYPE_GOAWAY: u8 = 0x7;
 
 impl<S> GoAwayWatcher<S> {
     pub fn new(inner: S, on_goaway: impl FnOnce() + Send + 'static) -> Self {
+        Self::with_callback(inner, Some(Box::new(on_goaway)))
+    }
+
+    /// Passes the I/O through untouched, without following frames.
+    pub fn disabled(inner: S) -> Self {
+        Self::with_callback(inner, None)
+    }
+
+    fn with_callback(inner: S, on_goaway: Option<Box<dyn FnOnce() + Send>>) -> Self {
         Self {
             inner,
-            on_goaway: Some(Box::new(on_goaway)),
+            on_goaway,
             header: [0; FRAME_HEADER_LEN],
             header_len: 0,
             payload_left: 0,
@@ -416,6 +425,59 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Random frame sequences, split at random read boundaries. Payloads are filled with the
+    /// GOAWAY type byte, and frame types and flags vary, so only a correctly tracked frame header
+    /// can tell where the GOAWAY is.
+    #[test]
+    fn goaway_watcher_fuzz() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::SmallRng::seed_from_u64(0x2026_1008);
+        for _ in 0..2000 {
+            let mut bytes = Vec::new();
+            let mut goaway_at = None;
+            for _ in 0..rng.random_range(1..8) {
+                // Every type but GOAWAY, including unknown ones, which a peer may send.
+                let mut kind = rng.random_range(0..=0xff);
+                if kind == FRAME_TYPE_GOAWAY {
+                    kind = 0x0;
+                }
+                let len = rng.random_range(0..64);
+                let mut f = frame(kind, &vec![FRAME_TYPE_GOAWAY; len]);
+                // Flags and stream id must not matter either.
+                f[4] = rng.random();
+                f[8] = FRAME_TYPE_GOAWAY;
+                bytes.extend(f);
+            }
+            if rng.random_bool(0.7) {
+                goaway_at = Some(bytes.len() + FRAME_HEADER_LEN);
+                bytes.extend(frame(FRAME_TYPE_GOAWAY, &[FRAME_TYPE_GOAWAY; 8]));
+                bytes.extend(frame(0x0, &[FRAME_TYPE_GOAWAY; 3]));
+            }
+
+            let fired = Arc::new(AtomicUsize::new(0));
+            let mut w = watcher(&fired);
+            let mut seen = 0;
+            while seen < bytes.len() {
+                let end = (seen + rng.random_range(1..=24)).min(bytes.len());
+                w.observe(&bytes[seen..end]);
+                seen = end;
+                let expected = usize::from(goaway_at.is_some_and(|at| seen >= at));
+                assert_eq!(
+                    fired.load(Ordering::SeqCst),
+                    expected,
+                    "{bytes:?} at {seen}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn goaway_watcher_disabled_never_fires() {
+        let mut w = GoAwayWatcher::disabled(tokio::io::empty());
+        w.observe(&frame(FRAME_TYPE_GOAWAY, &[0; 8]));
+        assert!(w.on_goaway.is_none());
     }
 
     #[tokio::test]

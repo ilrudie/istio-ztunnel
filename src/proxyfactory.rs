@@ -116,7 +116,7 @@ impl ProxyFactory {
     pub async fn new_proxies_from_factory(
         &self,
         proxy_drain: Option<DrainWatcher>,
-        // Drains just the inbound HBONE connections open at the time. See
+        // Drains just the inbound HBONE connections, not the whole proxy. See
         // `Inbound::with_connection_drain`.
         connection_drain: Option<ConnectionDrain>,
         proxy_workload_info: WorkloadInfo,

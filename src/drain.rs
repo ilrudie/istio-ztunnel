@@ -33,7 +33,7 @@ pub fn new() -> (DrainTrigger, DrainWatcher) {
 
 /// Drains a workload's inbound HBONE connections, typically because it is terminating. Every
 /// connection, whether open at the drain or accepted after it, sends a graceful GOAWAY and refuses
-/// new streams, while the streams it already has keep running. The listener keeps accepting, so a
+/// new streams the peer can retry elsewhere, while the streams it already has keep running. The listener keeps accepting, so a
 /// peer's new connection succeeds and learns from the GOAWAY that this endpoint is draining.
 /// Cloning shares the signal.
 #[derive(Clone, Debug, Default)]

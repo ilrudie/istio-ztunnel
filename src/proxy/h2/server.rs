@@ -101,7 +101,8 @@ impl RequestParts for Parts {
 /// was accepted (see [`crate::drain::ConnectionDrain`]). The connection then sends a graceful
 /// GOAWAY and keeps serving the streams it already has, for as long as they run. A stream the peer
 /// opens after that is reset with REFUSED_STREAM, which tells the peer it was never processed and
-/// is safe to retry against another endpoint.
+/// is safe to retry against another endpoint, but only if the peer said it can retry it (see
+/// [`crate::proxy::X_ISTIO_DRAIN_HEADER`]). Any other new stream is served as usual.
 pub async fn serve_connection<S, F, Fut>(
     cfg: Arc<config::Config>,
     s: S,
@@ -171,12 +172,15 @@ where
                     conn.graceful_shutdown();
                     goaway_sent = true;
                 }
-                if goaway_sent {
-                    // The peer opened this before it saw our GOAWAY. Refuse it rather than leave it
-                    // queued, so the peer retries it right away.
+                if goaway_sent && drain_refusable(&request) {
+                    // The peer opened this before it saw our GOAWAY, and can retry it elsewhere.
+                    // Refuse it rather than serve it, so it lands on an endpoint that is staying.
                     debug!("refusing new stream on a draining connection");
                     send.send_reset(h2::Reason::REFUSED_STREAM);
                     continue;
+                }
+                if goaway_sent {
+                    debug!("serving new stream on a draining connection, the peer cannot retry it");
                 }
                 let (request, recv) = request.into_parts();
                 let req = H2Request {
@@ -234,6 +238,14 @@ where
     // Mark we are done with the connection
     drop(drain);
     Ok(())
+}
+
+/// Whether the peer marked this CONNECT as safe to refuse while draining.
+fn drain_refusable<B>(request: &http::Request<B>) -> bool {
+    request
+        .headers()
+        .get(crate::proxy::X_ISTIO_DRAIN_HEADER)
+        .is_some_and(|v| v == crate::proxy::DRAIN_REFUSABLE)
 }
 
 #[cfg(test)]
@@ -316,7 +328,18 @@ mod tests {
         let _ = send.send_data(Bytes::new(), true);
     }
 
+    /// A CONNECT from a client that can retry it elsewhere, so a draining server may refuse it.
     fn connect_req() -> http::Request<()> {
+        let mut req = connect_req_not_refusable();
+        req.headers_mut().insert(
+            crate::proxy::X_ISTIO_DRAIN_HEADER,
+            http::HeaderValue::from_static(crate::proxy::DRAIN_REFUSABLE),
+        );
+        req
+    }
+
+    /// A CONNECT from a client that cannot retry it, such as an older ztunnel.
+    fn connect_req_not_refusable() -> http::Request<()> {
         http::Request::builder()
             .uri("127.0.0.1:8080")
             .method(http::Method::CONNECT)
@@ -500,6 +523,39 @@ mod tests {
             server.abort();
             client_conn.abort();
         }
+    }
+
+    /// A client that did not opt in to refusals is served on a draining connection, as it would be
+    /// without the drain: refusing it could fail a connection that has nowhere else to go.
+    #[tokio::test(start_paused = true)]
+    async fn connection_drain_serves_streams_that_did_not_opt_in() {
+        let connection_drain = ConnectionDrain::default();
+        let (_drain_trigger, drain) = crate::drain::new();
+        connection_drain.drain();
+        let conn = connect(&connection_drain, drain).await;
+
+        // Opened before the client sees the GOAWAY, as with the refused stream above.
+        conn.gate.close();
+        let (response, mut send) = conn
+            .client
+            .clone()
+            .ready()
+            .await
+            .unwrap()
+            .send_request(connect_req_not_refusable(), false)
+            .unwrap();
+        settle().await;
+        conn.gate.open();
+        let response = response.await.unwrap();
+        assert_eq!(response.status(), http::StatusCode::OK);
+        let mut recv = response.into_body();
+        assert_echoes(&mut send, &mut recv, "served").await;
+        // The GOAWAY still went out, so the client opens nothing more here.
+        assert!(conn.client.clone().ready().await.is_err());
+
+        send.send_data(Bytes::new(), true).unwrap();
+        while recv.data().await.is_some() {}
+        conn.server.await.unwrap().ok();
     }
 
     #[tokio::test(start_paused = true)]

@@ -79,20 +79,15 @@ impl DeprioritizedEndpoints {
     pub fn contains(&self, uid: &Strng) -> bool {
         self.0.iter().any(|tried| tried == uid)
     }
-}
 
-impl DeprioritizedEndpoints {
     fn extend(&mut self, uids: impl IntoIterator<Item = Strng>) {
         self.0.extend(uids);
     }
 }
 
-/// How long an endpoint stays deprioritized after it showed it is draining. It only needs to outlast
-/// the gap until the control plane removes the endpoint, which is normally well under a second.
-const DRAINING_ENDPOINT_TTL: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// Workloads that recently sent a GOAWAY on, or refused, an outbound HBONE connection, typically
-/// because they are terminating. Shared by every proxy on the node, so endpoint selection steers new
+/// Workloads that recently showed, on an outbound HBONE connection, that they are draining
+/// (typically because they are terminating): they sent a GOAWAY, or refused a CONNECT with
+/// REFUSED_STREAM. Shared by every proxy on the node, so endpoint selection steers new
 /// connections, and retries, away from them before the control plane catches up. Keyed by UID, so
 /// a new workload that reuses a draining one's IP is not affected.
 #[derive(Debug, Default)]
@@ -106,13 +101,13 @@ impl DrainingEndpoints {
             .insert(uid, std::time::Instant::now());
     }
 
-    /// The workloads still within their TTL. Drops the expired ones on the way.
-    fn current(&self) -> Vec<Strng> {
+    /// The workloads marked within the last `ttl`. Drops the expired ones on the way.
+    fn current(&self, ttl: std::time::Duration) -> Vec<Strng> {
         let mut draining = self.0.lock().expect("mutex");
         if draining.is_empty() {
             return Vec::new();
         }
-        draining.retain(|_, marked| marked.elapsed() < DRAINING_ENDPOINT_TTL);
+        draining.retain(|_, marked| marked.elapsed() < ttl);
         draining.keys().cloned().collect()
     }
 }
@@ -686,22 +681,27 @@ impl DemandProxyState {
         }
     }
 
-    /// Deprioritizes the workload at `addr` in endpoint selection for a while, because it showed
-    /// it is draining: it sent a GOAWAY, or refused an HBONE connection. An address we don't know
-    /// (it may already be gone) is ignored.
+    /// Deprioritizes the workload at `addr` in endpoint selection for a while, because it sent a
+    /// GOAWAY. An address we don't know (it may already be gone) is ignored.
     pub fn mark_draining(&self, addr: &NetworkAddress, reason: &'static str) {
         let Some(wl) = self.read().workloads.find_address(addr) else {
             return;
         };
-        info!(workload = %wl.uid, %addr, reason, "upstream is draining, deprioritizing endpoint");
-        self.draining.mark(wl.uid.clone());
+        self.mark_workload_draining(&wl.uid, reason);
     }
 
-    /// The endpoints selection should avoid when it can: those that recently showed they are
-    /// draining.
-    pub fn draining_endpoints(&self) -> DeprioritizedEndpoints {
+    /// Deprioritizes the workload `uid` in endpoint selection for a while, because it showed it
+    /// is draining.
+    pub fn mark_workload_draining(&self, uid: &Strng, reason: &'static str) {
+        info!(workload = %uid, reason, "upstream is draining, deprioritizing endpoint");
+        self.draining.mark(uid.clone());
+    }
+
+    /// The endpoints selection should avoid when it can: those that showed they are draining
+    /// within the last `ttl`.
+    pub fn draining_endpoints(&self, ttl: std::time::Duration) -> DeprioritizedEndpoints {
         let mut deprioritized = DeprioritizedEndpoints::default();
-        deprioritized.extend(self.draining.current());
+        deprioritized.extend(self.draining.current(ttl));
         deprioritized
     }
 
@@ -2346,14 +2346,16 @@ mod tests {
 
     #[test]
     fn draining_endpoints_expire() {
+        let ttl = Duration::from_secs(10);
         let draining = DrainingEndpoints::default();
-        assert!(draining.current().is_empty());
+        assert!(draining.current(ttl).is_empty());
         draining.mark(strng::new("fresh"));
-        draining.0.lock().unwrap().insert(
-            strng::new("stale"),
-            std::time::Instant::now() - DRAINING_ENDPOINT_TTL,
-        );
-        assert_eq!(draining.current(), vec![strng::new("fresh")]);
+        draining
+            .0
+            .lock()
+            .unwrap()
+            .insert(strng::new("stale"), std::time::Instant::now() - ttl);
+        assert_eq!(draining.current(ttl), vec![strng::new("fresh")]);
         // Expired entries are dropped, not just skipped.
         assert_eq!(draining.0.lock().unwrap().len(), 1);
     }

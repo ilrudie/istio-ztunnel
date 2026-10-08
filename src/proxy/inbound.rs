@@ -55,7 +55,7 @@ use crate::tls::TlsError;
 pub struct Inbound {
     listener: socket::Listener,
     drain: DrainWatcher,
-    /// Drains the HBONE connections open at the time. See [`Self::with_connection_drain`].
+    /// Drains this listener's HBONE connections. See [`Self::with_connection_drain`].
     connection_drain: Option<ConnectionDrain>,
     pi: Arc<ProxyInputs>,
     enable_orig_src: bool,
@@ -86,7 +86,7 @@ impl Inbound {
 
     /// Lets `connection_drain` drain this listener's HBONE connections: each one, including any
     /// accepted after the drain, sends a graceful GOAWAY, lets its existing streams finish, and
-    /// refuses new ones. The listener keeps accepting, so a peer that connects after the drain gets
+    /// refuses new ones the peer can retry elsewhere. The listener keeps accepting, so a peer that connects after the drain gets
     /// the GOAWAY (and steers away from this endpoint) instead of a TCP refusal.
     pub fn with_connection_drain(mut self, connection_drain: ConnectionDrain) -> Self {
         self.connection_drain = Some(connection_drain);
@@ -197,7 +197,8 @@ impl Inbound {
                     serve.await
                 };
                 // This is small since it only handles the TLS layer -- the HTTP2 layer is boxed
-                // and measured above.
+                // and measured above. The upper bound leaves room for the connection drain
+                // receiver.
                 assertions::size_between_ref(1000, 1700, &serve_client);
                 tokio::task::spawn(serve_client.in_current_span());
             }

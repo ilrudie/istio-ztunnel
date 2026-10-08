@@ -30,7 +30,7 @@ use super::netns::{InpodNetns, NetnsID};
 // Note: we can't drain on drop, as drain is async (it waits for the drain to finish).
 pub(super) struct WorkloadState {
     drain: DrainTrigger,
-    /// Drains the inbound HBONE connections open at the time, on a DrainWorkload.
+    /// Drains the workload's inbound HBONE connections, on a DrainWorkload.
     connection_drain: drain::ConnectionDrain,
     netns_id: NetnsID,
 }

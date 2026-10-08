@@ -52,8 +52,9 @@ message DelWorkload {
 
 // Drain a workload's inbound HBONE traffic, typically because it is terminating. Ztunnel sends a
 // graceful GOAWAY on every inbound HBONE connection to the workload, both those open when the
-// message arrives and any accepted afterwards. Streams already running keep running; any new stream
-// (CONNECT) is reset with REFUSED_STREAM, so the peer can retry it elsewhere. New HBONE connections
+// message arrives and any accepted afterwards. Streams already running keep running. A new stream
+// (CONNECT) whose client marked it as retriable elsewhere (the `x-istio-drain: refusable` header)
+// is reset with REFUSED_STREAM; any other new stream is served as usual. New HBONE connections
 // are still accepted, so peers learn the workload is draining from the GOAWAY rather than from a
 // TCP refusal. The workload's outbound traffic and DNS are unaffected. Only sent if ztunnel
 // advertised the DRAIN_WORKLOAD capability.

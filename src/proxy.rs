@@ -575,6 +575,12 @@ pub struct TraceParent {
 pub const BAGGAGE_HEADER: &str = "baggage";
 pub const TRACEPARENT_HEADER: &str = "traceparent";
 pub const X_FORWARDED_NETWORK_HEADER: &str = "x-forwarded-network";
+/// Sent on an HBONE CONNECT, with the value [`DRAIN_REFUSABLE`], by a client that can retry the
+/// CONNECT on another endpoint. A draining server resets only these CONNECTs with REFUSED_STREAM,
+/// and serves every other one as usual, so a client that cannot retry (an older ztunnel, one with
+/// retries off, or one with no other endpoint left) is never refused.
+pub const X_ISTIO_DRAIN_HEADER: &str = "x-istio-drain";
+pub const DRAIN_REFUSABLE: &str = "refusable";
 
 impl TraceParent {
     pub fn header(&self) -> hyper::header::HeaderValue {

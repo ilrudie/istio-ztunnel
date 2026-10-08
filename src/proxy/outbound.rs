@@ -30,8 +30,8 @@ use crate::strng::Strng;
 use crate::proxy::connection_manager::{OutboundConnectionGuard, await_revocation};
 use crate::proxy::metrics::Reporter;
 use crate::proxy::{
-    BAGGAGE_HEADER, Error, HboneAddress, ProxyInputs, TRACEPARENT_HEADER, TraceParent,
-    X_FORWARDED_NETWORK_HEADER, util,
+    BAGGAGE_HEADER, DRAIN_REFUSABLE, Error, HboneAddress, ProxyInputs, TRACEPARENT_HEADER,
+    TraceParent, X_FORWARDED_NETWORK_HEADER, X_ISTIO_DRAIN_HEADER, util,
 };
 use crate::proxy::{
     ConnectionOpen, ConnectionResult, ConnectionResultBuilder, DerivedWorkload, metrics,
@@ -277,6 +277,32 @@ impl OutboundConnection {
         Self::retry_within_deadline(start, backoff).then_some(backoff)
     }
 
+    /// Whether the CONNECT for `req` should let a draining destination refuse it, which it then
+    /// does with REFUSED_STREAM (see [`X_ISTIO_DRAIN_HEADER`]). Only when a refusal costs nothing:
+    /// a retry is left, and could start in time, and the endpoint was not picked as a last resort.
+    /// Selection only picks a deprioritized endpoint when nothing else is selectable, so if the
+    /// draining one is all there is, it serves the connection rather than refuse it.
+    fn drain_refusable(
+        &self,
+        req: &Request,
+        deprioritized: &DeprioritizedEndpoints,
+        retries: usize,
+        max_retries: usize,
+        start: Instant,
+    ) -> bool {
+        retries < max_retries
+            && Self::retry_within_deadline(start, self.configured_retry_backoff(retries + 1))
+            && req
+                .actual_destination_workload
+                .as_ref()
+                .is_some_and(|wl| !deprioritized.contains(&wl.uid))
+    }
+
+    /// Whether `err` is a draining destination refusing a CONNECT we let it refuse.
+    fn is_drain_refusal(err: &Error) -> bool {
+        matches!(err, Error::H2(e) if e.reason() == Some(h2::Reason::REFUSED_STREAM))
+    }
+
     /// The smallest connect timeout an attempt may be handed.
     ///
     /// A share small enough to expire during an ordinary connect is worse than no retry at all:
@@ -340,7 +366,10 @@ impl OutboundConnection {
         // else, so a retry does not just re-roll the dice onto the same dead endpoint.
         // Seeded with the endpoints that recently showed they are draining, so even the first
         // attempt avoids them when it can.
-        let mut deprioritized = self.pi.state.draining_endpoints();
+        let mut deprioritized = self
+            .pi
+            .state
+            .draining_endpoints(self.pi.cfg.draining_endpoint_ttl);
         loop {
             // First find the source workload of this traffic. If we don't know where the request is from
             // we will reject it.
@@ -404,7 +433,12 @@ impl OutboundConnection {
                     Box::pin(self.connect_hbone_double(source_addr, &req, budget)).await
                 }
                 OutboundProtocol::HBONE => self
-                    .connect_hbone(source_addr, &req, budget)
+                    .connect_hbone(
+                        source_addr,
+                        &req,
+                        budget,
+                        self.drain_refusable(&req, &deprioritized, retries, max_retries, start),
+                    )
                     .await
                     .map(|upstream| (upstream, None)),
                 OutboundProtocol::TCP => self
@@ -424,6 +458,15 @@ impl OutboundConnection {
                     ));
                 }
                 Err(e) => {
+                    if Self::is_drain_refusal(&e)
+                        && let Some(wl) = &req.actual_destination_workload
+                    {
+                        // Only a draining endpoint refuses, so steer every connection on the node
+                        // away from it, not just this connect's retries.
+                        self.pi
+                            .state
+                            .mark_workload_draining(&wl.uid, "refused CONNECT");
+                    }
                     let backoff = self.retry_delay(&e, retries, max_retries, start);
                     connection_result_builder.build().record(Err(e));
                     let backoff = backoff?;
@@ -521,7 +564,8 @@ impl OutboundConnection {
         // Create the outer HBONE stream. The outer tunnel's revocation signal is captured here so
         // it can still be attributed once we are splicing over the inner tunnel.
         let (upgraded, _, outer_revoked) =
-            Box::pin(self.send_hbone_request(remote_addr, req, deadline)).await?;
+            // Never refusable: the outer leg ends at a gateway, not at the draining workload.
+            Box::pin(self.send_hbone_request(remote_addr, req, deadline, false)).await?;
         // Wrap upgraded to implement tokio's Async{Write,Read}
         let upgraded = TokioH2Stream::new(upgraded);
 
@@ -583,7 +627,8 @@ impl OutboundConnection {
         // The inner tunnel's revocation signal
         let inner_revoked = sender.revoked_receiver();
         let origin_network = &self.pi.cfg.network;
-        let http_request = self.create_hbone_request(remote_addr, req, Some(origin_network));
+        // Not refusable either: the retry loop cannot tell which leg refused.
+        let http_request = self.create_hbone_request(remote_addr, req, Some(origin_network), false);
         let (inner_upgraded, baggage) = super::with_deadline(
             deadline,
             super::HandshakeStage::InnerConnect,
@@ -611,16 +656,18 @@ impl OutboundConnection {
         ))
     }
 
-    /// Connects a single HBONE tunnel to `req.actual_destination`.
+    /// Connects a single HBONE tunnel to `req.actual_destination`. `drain_refusable` lets a
+    /// draining destination refuse the CONNECT; see [`Self::drain_refusable`].
     async fn connect_hbone(
         &mut self,
         remote_addr: SocketAddr,
         req: &Request,
         connect_timeout: Option<Duration>,
+        drain_refusable: bool,
     ) -> Result<ConnectedUpstream, Error> {
         let deadline = self.deadline_after_cert_fetch(connect_timeout).await?;
         let (stream, _, revoked) =
-            Box::pin(self.send_hbone_request(remote_addr, req, deadline)).await?;
+            Box::pin(self.send_hbone_request(remote_addr, req, deadline, drain_refusable)).await?;
         Ok(ConnectedUpstream::Hbone {
             stream,
             // Single hop: there is no inner leg, and `await_revocation(None)` parks forever.
@@ -704,6 +751,7 @@ impl OutboundConnection {
         remote_addr: SocketAddr,
         req: &Request,
         origin_network: Option<&Strng>,
+        drain_refusable: bool,
     ) -> http::Request<()> {
         let mut builder = http::Request::builder()
             .uri(
@@ -725,6 +773,9 @@ impl OutboundConnection {
         if let Some(network) = origin_network {
             builder = builder.header(X_FORWARDED_NETWORK_HEADER, network.as_str());
         }
+        if drain_refusable {
+            builder = builder.header(X_ISTIO_DRAIN_HEADER, DRAIN_REFUSABLE);
+        }
 
         builder
             .body(())
@@ -737,12 +788,13 @@ impl OutboundConnection {
         remote_addr: SocketAddr,
         req: &Request,
         deadline: Option<tokio::time::Instant>,
+        drain_refusable: bool,
     ) -> Result<(H2Stream, Option<Baggage>, Option<watch::Receiver<bool>>), Error> {
         // This is the single cluster/single-HBONE codepath (and also the outer tunnel
         // for double HBONE). We don't need the x-istio-origin-network header here because:
         // - For single HBONE: both source and destination are in the same network
         // - For double HBONE outer: the gateway doesn't need origin network info
-        let request = self.create_hbone_request(remote_addr, req, None);
+        let request = self.create_hbone_request(remote_addr, req, None, drain_refusable);
         let pool_key = Box::new(WorkloadKey {
             src_id: req.source.identity(),
             // Clone here shouldn't be needed ideally, we could just take ownership of Request.
@@ -2438,7 +2490,7 @@ mod tests {
         let remote_addr = "127.0.0.1:12345".parse().unwrap();
 
         // Test the single HBONE case - header should NOT be added when origin_network is None
-        let http_request_no_header = outbound.create_hbone_request(remote_addr, &req, None);
+        let http_request_no_header = outbound.create_hbone_request(remote_addr, &req, None, false);
         assert!(
             http_request_no_header
                 .headers()
@@ -2450,7 +2502,7 @@ mod tests {
         // Test the double HBONE inner request case - header should be added when network is specified
         let network = crate::strng::Strng::from("test-network");
         let http_request_with_header =
-            outbound.create_hbone_request(remote_addr, &req, Some(&network));
+            outbound.create_hbone_request(remote_addr, &req, Some(&network), false);
         assert_eq!(
             http_request_with_header
                 .headers()
@@ -3102,6 +3154,85 @@ mod tests {
                 "a deprioritized endpoint must not be re-selected while another remains"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn drain_refusable_only_when_a_refusal_can_be_retried_elsewhere() {
+        initialize_telemetry();
+        let dest = XdsWorkload {
+            tunnel_protocol: xds::istio::workload::TunnelProtocol::Hbone.into(),
+            ..dest_workload(2, "dest-workload")
+        };
+        let oc = test_outbound_connection(vec![dest], vec![]).await;
+        let local = oc
+            .pi
+            .local_workload_information
+            .get_workload()
+            .await
+            .unwrap();
+        let req = oc
+            .build_request(
+                local,
+                "127.0.0.1".parse().unwrap(),
+                "127.0.0.2:8080".parse().unwrap(),
+                &DeprioritizedEndpoints::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(req.protocol, OutboundProtocol::HBONE);
+        let uid = req
+            .actual_destination_workload
+            .as_ref()
+            .unwrap()
+            .uid
+            .clone();
+        let fresh = DeprioritizedEndpoints::default();
+        let now = Instant::now();
+
+        assert!(oc.drain_refusable(&req, &fresh, 0, 2, now));
+        assert!(oc.drain_refusable(&req, &fresh, 1, 2, now));
+        // No retry left, so a refusal would fail the connection.
+        assert!(!oc.drain_refusable(&req, &fresh, 2, 2, now));
+        assert!(!oc.drain_refusable(&req, &fresh, 0, 0, now));
+        // A retry is left, but could not start before the connect budget runs out.
+        assert!(!oc.drain_refusable(
+            &req,
+            &fresh,
+            0,
+            2,
+            started_ago(crate::proxy::CONNECTION_TIMEOUT)
+        ));
+        // Selection only picks a deprioritized endpoint as a last resort: there is nowhere else to
+        // go, so the draining endpoint must serve this one.
+        let mut last_resort = DeprioritizedEndpoints::default();
+        last_resort.push(uid);
+        assert!(!oc.drain_refusable(&req, &last_resort, 0, 2, now));
+
+        let remote_addr = "127.0.0.1:12345".parse().unwrap();
+        assert_eq!(
+            oc.create_hbone_request(remote_addr, &req, None, true)
+                .headers()
+                .get(X_ISTIO_DRAIN_HEADER)
+                .unwrap(),
+            DRAIN_REFUSABLE
+        );
+        assert!(
+            oc.create_hbone_request(remote_addr, &req, None, false)
+                .headers()
+                .get(X_ISTIO_DRAIN_HEADER)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn drain_refusal_is_a_refused_stream() {
+        let refused = Error::H2(h2::Error::from(h2::Reason::REFUSED_STREAM));
+        assert!(OutboundConnection::is_drain_refusal(&refused));
+        // And it is retried, on another endpoint.
+        assert!(OutboundConnection::is_retriable_error(&refused));
+        assert!(!OutboundConnection::is_drain_refusal(&Error::H2(
+            h2::Error::from(h2::Reason::INTERNAL_ERROR)
+        )));
     }
 
     #[derive(PartialEq, Debug)]
