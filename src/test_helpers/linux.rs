@@ -322,6 +322,22 @@ impl WorkloadManager {
         Ok(())
     }
 
+    /// Has the workload's node ztunnel drain its inbound HBONE traffic, as the CNI does when a pod
+    /// starts terminating. The workload keeps running. Only meaningful in shared (inpod) mode.
+    pub async fn drain_workload(&mut self, name: &str) -> anyhow::Result<()> {
+        for w in self.workloads.iter().filter(|w| w.workload.name == name) {
+            if let Some(zt) = self.ztunnels.get_mut(&w.workload.node.to_string()) {
+                let msg = inpod::Message::Drain(w.workload.uid.to_string());
+                zt.fd_sender
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("drain needs an inpod ztunnel"))?
+                    .send_and_wait(msg)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
     pub async fn delete_workload(&mut self, name: &str) -> anyhow::Result<()> {
         let mut workloads = vec![];
         std::mem::swap(&mut self.workloads, &mut workloads);

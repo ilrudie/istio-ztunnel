@@ -6,6 +6,9 @@ package istio.workload.zds;
 
 option go_package="pkg/zdsapi";
 
+// Kept in sync with pkg/zdsapi/zds.proto in istio/istio (that copy also carries the license
+// header). Change both together.
+
 enum Version {
   NOT_USED = 0;
   V1 = 1;

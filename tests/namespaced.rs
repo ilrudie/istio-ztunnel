@@ -860,6 +860,100 @@ mod namespaced {
         Ok(())
     }
 
+    /// A drained workload stops getting new connections while another endpoint remains, and still
+    /// gets them when it is the only one: the client lets it refuse a CONNECT only when it can
+    /// retry elsewhere.
+    #[tokio::test]
+    async fn drained_workload_steers_new_connections() -> anyhow::Result<()> {
+        let mut manager = setup_netns_test!(Shared);
+        // Draining only steers clients that retry.
+        let client_cfg = config::Config {
+            outbound_connect_max_retries: 2,
+            ..config::parse_config().unwrap()
+        };
+        let local = manager
+            .deploy_dedicated_ztunnel(DEFAULT_NODE, Some(client_cfg), None)
+            .await?;
+        let remote = manager.deploy_ztunnel(REMOTE_NODE).await?;
+        manager
+            .service_builder("service")
+            .addresses(vec![NetworkAddress {
+                network: strng::EMPTY,
+                address: TEST_VIP.parse::<IpAddr>()?,
+            }])
+            .ports(HashMap::from([(80u16, 80u16)]))
+            .register()
+            .await?;
+        let draining = manager
+            .workload_builder("server1", REMOTE_NODE)
+            .hbone()
+            .service("default/service.default.svc.cluster.local", 80, SERVER_PORT)
+            .register()
+            .await?;
+        let draining_ip = draining.ip();
+        run_tcp_server(draining)?;
+        run_tcp_server(
+            manager
+                .workload_builder("server2", REMOTE_NODE)
+                .hbone()
+                .service("default/service.default.svc.cluster.local", 80, SERVER_PORT)
+                .register()
+                .await?,
+        )?;
+        let client = manager
+            .workload_builder("client", DEFAULT_NODE)
+            .register()
+            .await?;
+
+        manager.drain_workload("server1").await?;
+
+        // Through the service, every connection lands on server2.
+        run_tcp_client_iters(&client, 20, manager.resolver(), &format!("{TEST_VIP}:80"))?;
+        // Connections the client established to `server`. A refused attempt is recorded as opened
+        // and then failed, so it does not count.
+        let connected_to = |metrics: &ParsedMetrics, server: &str| {
+            let labels = HashMap::from([
+                ("reporter".to_string(), "source".to_string()),
+                (
+                    "destination_principal".to_string(),
+                    format!("spiffe://cluster.local/ns/default/sa/{server}"),
+                ),
+            ]);
+            metrics.query_sum(CONNECTIONS_OPENED, &labels)
+                - metrics.query_sum("istio_tcp_connections_failed_total", &labels)
+        };
+        let metrics = local.metrics().await?;
+        assert_eq!(connected_to(&metrics, "server1"), 0);
+        assert_eq!(connected_to(&metrics, "server2"), 20);
+
+        // Addressed directly, server1 is the only endpoint, so it still serves the connection.
+        run_tcp_client_iters(
+            &client,
+            1,
+            manager.resolver(),
+            &format!("{draining_ip}:{SERVER_PORT}"),
+        )?;
+        let metrics = local.metrics().await?;
+        assert_eq!(connected_to(&metrics, "server1"), 1);
+        // Whatever reached server1 after the drain was either refused (the client could retry) or
+        // served (it could not).
+        let streams = remote.metrics().await?;
+        let refused = streams.query_sum(
+            "istio_hbone_drain_streams_total",
+            &HashMap::from([("action".to_string(), "refused".to_string())]),
+        );
+        let served = streams.query_sum(
+            "istio_hbone_drain_streams_total",
+            &HashMap::from([("action".to_string(), "served".to_string())]),
+        );
+        assert!(served >= 1, "the direct connection was served");
+        assert!(
+            refused <= 2,
+            "server1 is marked draining after its first refusal"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_ztunnel_shutdown() -> anyhow::Result<()> {
         let mut manager = setup_netns_test!(Shared);

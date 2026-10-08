@@ -28,7 +28,7 @@ use crate::identity::Identity;
 use crate::strng::Strng;
 
 use crate::proxy::connection_manager::{OutboundConnectionGuard, await_revocation};
-use crate::proxy::metrics::Reporter;
+use crate::proxy::metrics::{DrainingReason, Reporter};
 use crate::proxy::{
     BAGGAGE_HEADER, DRAIN_REFUSABLE, Error, HboneAddress, ProxyInputs, TRACEPARENT_HEADER,
     TraceParent, X_FORWARDED_NETWORK_HEADER, X_ISTIO_DRAIN_HEADER, util,
@@ -465,7 +465,7 @@ impl OutboundConnection {
                         // away from it, not just this connect's retries.
                         self.pi
                             .state
-                            .mark_workload_draining(&wl.uid, "refused CONNECT");
+                            .mark_workload_draining(&wl.uid, DrainingReason::refused);
                     }
                     let backoff = self.retry_delay(&e, retries, max_retries, start);
                     connection_result_builder.build().record(Err(e));

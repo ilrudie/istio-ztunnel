@@ -14,6 +14,7 @@
 
 use crate::inpod::test_helpers::{
     read_hello, read_msg, send_snap_sent, send_workload_added, send_workload_del,
+    send_workload_drain,
 };
 
 use crate::inpod::istio::zds::WorkloadInfo;
@@ -33,6 +34,8 @@ pub struct StartZtunnelMessage {
 #[derive(Debug)]
 pub enum Message {
     Start(StartZtunnelMessage),
+    /// Drain the workload's inbound HBONE traffic (DrainWorkload); it keeps running.
+    Drain(String),
     Stop(String),
 }
 
@@ -78,6 +81,13 @@ pub async fn start_ztunnel_server(bind_path: PathBuf) -> MpscAckSender<Message> 
                     debug!(uid, %fd, "sending start message");
                     let uid = crate::inpod::WorkloadUid::new(uid);
                     send_workload_added(&mut ztun_sock, uid, workload_info, fd).await;
+                    orig_uid
+                }
+                Message::Drain(uid) => {
+                    let orig_uid = uid.clone();
+                    debug!(uid, "sending drain message");
+                    let uid = crate::inpod::WorkloadUid::new(uid);
+                    send_workload_drain(&mut ztun_sock, uid).await;
                     orig_uid
                 }
                 Message::Stop(uid) => {

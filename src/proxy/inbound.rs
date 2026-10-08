@@ -124,7 +124,13 @@ impl Inbound {
                 let start = Instant::now();
                 let drain = drain.clone();
                 // Subscribe on accept, so a drain that arrives during the handshakes still applies.
-                let connection_drain = self.connection_drain.as_ref().map(|d| d.subscribe());
+                let connection_drain =
+                    self.connection_drain
+                        .as_ref()
+                        .map(|d| h2::server::ConnectionDrainHandle {
+                            signal: d.subscribe(),
+                            metrics: self.pi.metrics.clone(),
+                        });
                 let force_shutdown = force_shutdown.clone();
                 let pi = self.pi.clone();
                 let dst = to_canonical(raw_socket.local_addr().expect("local_addr available"));

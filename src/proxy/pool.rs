@@ -38,6 +38,7 @@ use flurry;
 
 use crate::proxy::h2::H2Stream;
 use crate::proxy::h2::client::{H2ConnectClient, WorkloadKey};
+use crate::proxy::metrics::DrainingReason;
 use pingora_pool;
 use tokio::io;
 
@@ -149,7 +150,7 @@ impl ConnSpawner {
                             self.cfg.network.clone(),
                             key.dst.ip(),
                         );
-                        move || state.mark_draining(&addr, "sent GOAWAY")
+                        move || state.mark_draining(&addr, DrainingReason::goaway)
                     })
                 } else {
                     h2::client::GoAwayWatcher::disabled(tls_stream)

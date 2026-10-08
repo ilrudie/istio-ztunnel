@@ -14,6 +14,7 @@
 
 use crate::authpol_log;
 use crate::identity::{Identity, SecretManager};
+use crate::proxy::metrics::{DrainingReason, DrainingSelection};
 use crate::proxy::{Error, OnDemandDnsLabels};
 use crate::rbac::Authorization;
 use crate::state::policy::PolicyStore;
@@ -57,31 +58,46 @@ pub mod policy;
 pub mod service;
 pub mod workload;
 
-/// Endpoints, keyed by workload UID, that an earlier attempt on this connection already tried
-/// and failed to reach.
+/// Endpoints, keyed by workload UID, that selection should avoid: those an earlier attempt on
+/// this connection already tried and failed to reach, and those that recently showed they are
+/// draining (see [`DrainingEndpoints`]).
 ///
 /// Selection treats these as a last resort rather than as ineligible: a retry prefers an untried
 /// endpoint, but still falls back to a tried one when nothing else is selectable. The list is
-/// per-connection and holds at most one entry per retry, so a `Vec` scan beats hashing.
+/// per-connection and holds at most one entry per retry, plus the draining set, which is normally
+/// empty or tiny, so a `Vec` scan beats hashing.
 #[derive(Debug, Default, Clone)]
-pub struct DeprioritizedEndpoints(Vec<Strng>);
+pub struct DeprioritizedEndpoints {
+    uids: Vec<Strng>,
+    /// The first `draining` entries of `uids` are the draining endpoints; the rest were tried.
+    draining: usize,
+    /// Records what selection does with a draining endpoint. Unset in tests.
+    metrics: Option<Arc<proxy::Metrics>>,
+}
 
 impl DeprioritizedEndpoints {
     /// Records `uid` as tried. Duplicates are harmless, so callers need not check first.
     pub fn push(&mut self, uid: Strng) {
-        self.0.push(uid);
+        self.uids.push(uid);
     }
 
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.uids.is_empty()
     }
 
     pub fn contains(&self, uid: &Strng) -> bool {
-        self.0.iter().any(|tried| tried == uid)
+        self.uids.iter().any(|tried| tried == uid)
     }
 
-    fn extend(&mut self, uids: impl IntoIterator<Item = Strng>) {
-        self.0.extend(uids);
+    /// Whether `uid` is deprioritized because it is draining, rather than because it was tried.
+    fn is_draining(&self, uid: &Strng) -> bool {
+        self.uids[..self.draining].iter().any(|d| d == uid)
+    }
+
+    fn record_draining_selection(&self, outcome: proxy::metrics::DrainingSelection) {
+        if let Some(metrics) = &self.metrics {
+            metrics.record_draining_selection(outcome);
+        }
     }
 }
 
@@ -503,6 +519,9 @@ impl ProxyState {
 
         // Collected only here, since the fallback below walks the endpoints a second time.
         let candidates: Vec<_> = candidates.collect();
+        let has_draining = candidates
+            .iter()
+            .any(|(_, wl)| deprioritized.is_draining(&wl.uid));
         {
             let fresh = candidates
                 .iter()
@@ -514,6 +533,9 @@ impl ProxyState {
             // service whose top-ranked tier holds a single endpoint to that same dead endpoint on
             // every retry.
             if let Some(selected) = self.select_endpoint(src, svc, fresh) {
+                if has_draining {
+                    deprioritized.record_draining_selection(DrainingSelection::skipped);
+                }
                 return Some(selected);
             }
             // Nothing selectable among the untried endpoints: either there were none, or a Strict
@@ -522,7 +544,13 @@ impl ProxyState {
             // than it was before the deprioritized list existed.
         }
 
-        self.select_endpoint(src, svc, candidates.into_iter())
+        let selected = self.select_endpoint(src, svc, candidates.into_iter());
+        if let Some((_, wl)) = &selected
+            && deprioritized.is_draining(&wl.uid)
+        {
+            deprioritized.record_draining_selection(DrainingSelection::fallback);
+        }
+        selected
     }
 
     /// Picks one of `candidates`, honoring the service's locality load balancing mode and
@@ -681,9 +709,9 @@ impl DemandProxyState {
         }
     }
 
-    /// Deprioritizes the workload at `addr` in endpoint selection for a while, because it sent a
-    /// GOAWAY. An address we don't know (it may already be gone) is ignored.
-    pub fn mark_draining(&self, addr: &NetworkAddress, reason: &'static str) {
+    /// Deprioritizes the workload at `addr` in endpoint selection for a while, because it showed
+    /// it is draining. An address we don't know (it may already be gone) is ignored.
+    pub fn mark_draining(&self, addr: &NetworkAddress, reason: DrainingReason) {
         let Some(wl) = self.read().workloads.find_address(addr) else {
             return;
         };
@@ -692,17 +720,21 @@ impl DemandProxyState {
 
     /// Deprioritizes the workload `uid` in endpoint selection for a while, because it showed it
     /// is draining.
-    pub fn mark_workload_draining(&self, uid: &Strng, reason: &'static str) {
-        info!(workload = %uid, reason, "upstream is draining, deprioritizing endpoint");
+    pub fn mark_workload_draining(&self, uid: &Strng, reason: DrainingReason) {
+        info!(workload = %uid, ?reason, "upstream is draining, deprioritizing endpoint");
+        self.metrics.record_draining_marked(reason);
         self.draining.mark(uid.clone());
     }
 
     /// The endpoints selection should avoid when it can: those that showed they are draining
     /// within the last `ttl`.
     pub fn draining_endpoints(&self, ttl: std::time::Duration) -> DeprioritizedEndpoints {
-        let mut deprioritized = DeprioritizedEndpoints::default();
-        deprioritized.extend(self.draining.current(ttl));
-        deprioritized
+        let uids = self.draining.current(ttl);
+        DeprioritizedEndpoints {
+            draining: uids.len(),
+            uids,
+            metrics: Some(self.metrics.clone()),
+        }
     }
 
     pub fn read(&self) -> RwLockReadGuard<'_, ProxyState> {
@@ -2358,6 +2390,84 @@ mod tests {
         assert_eq!(draining.current(ttl), vec![strng::new("fresh")]);
         // Expired entries are dropped, not just skipped.
         assert_eq!(draining.0.lock().unwrap().len(), 1);
+    }
+
+    /// Endpoints marked draining are counted, and so is what selection then does with them;
+    /// endpoints that were only tried by an earlier attempt are not.
+    #[tokio::test]
+    async fn draining_endpoint_metrics() {
+        initialize_telemetry();
+        let workload = |name: &str, last_octet: u8| Workload {
+            uid: format!("cluster1//v1/Pod/default/{name}").into(),
+            name: name.into(),
+            namespace: "default".into(),
+            workload_ips: vec![IpAddr::V4(Ipv4Addr::new(192, 168, 0, last_octet))],
+            network: "network".into(),
+            ..test_helpers::test_default_workload()
+        };
+        let (wl_a, wl_b) = (workload("wl_a", 1), workload("wl_b", 2));
+        let mut state = ProxyState::new(None);
+        for wl in [&wl_a, &wl_b] {
+            state.workloads.insert(Arc::new(wl.clone()));
+        }
+        let endpoint = |wl: &Workload| Endpoint {
+            workload_uid: wl.uid.clone(),
+            port: HashMap::from([(80u16, 80u16)]),
+            status: HealthStatus::Healthy,
+        };
+        let svc = Service {
+            endpoints: EndpointSet::from_list([endpoint(&wl_a), endpoint(&wl_b)]),
+            ports: HashMap::from([(80u16, 80u16)]),
+            ..test_helpers::mock_default_service()
+        };
+        let only_a = Service {
+            endpoints: EndpointSet::from_list([endpoint(&wl_a)]),
+            ..svc.clone()
+        };
+        let metrics = Arc::new(crate::proxy::Metrics::new(&mut Registry::default()));
+        let demand = DemandProxyState::new(
+            Arc::new(RwLock::new(state)),
+            None,
+            ResolverConfig::default(),
+            ResolverOpts::default(),
+            metrics.clone(),
+        );
+        let marked = |reason| {
+            metrics
+                .draining_endpoints_marked
+                .get_or_create(&crate::proxy::metrics::DrainingMarkLabels { reason })
+                .get()
+        };
+        let selections = |outcome| {
+            metrics
+                .draining_endpoint_selections
+                .get_or_create(&crate::proxy::metrics::DrainingSelectionLabels { outcome })
+                .get()
+        };
+        let pick = |svc: &Service, d: &DeprioritizedEndpoints| {
+            demand
+                .read()
+                .load_balance(&wl_a, svc, 80, ServiceResolutionMode::Standard, d)
+                .map(|(ep, _)| ep.workload_uid.clone())
+        };
+
+        demand.mark_workload_draining(&wl_a.uid, DrainingReason::refused);
+        assert_eq!(marked(DrainingReason::refused), 1);
+        assert_eq!(marked(DrainingReason::goaway), 0);
+        let draining = demand.draining_endpoints(Duration::from_secs(10));
+
+        assert_eq!(pick(&svc, &draining), Some(wl_b.uid.clone()));
+        assert_eq!(selections(DrainingSelection::skipped), 1);
+        assert_eq!(pick(&only_a, &draining), Some(wl_a.uid.clone()));
+        assert_eq!(selections(DrainingSelection::fallback), 1);
+
+        // An endpoint that was only tried, not marked draining, is not counted.
+        let mut tried = demand.draining_endpoints(Duration::ZERO);
+        tried.push(wl_a.uid.clone());
+        assert_eq!(pick(&svc, &tried), Some(wl_b.uid.clone()));
+        assert_eq!(pick(&only_a, &tried), Some(wl_a.uid.clone()));
+        assert_eq!(selections(DrainingSelection::skipped), 1);
+        assert_eq!(selections(DrainingSelection::fallback), 1);
     }
 
     #[tokio::test]

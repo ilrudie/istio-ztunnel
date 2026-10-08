@@ -17,6 +17,7 @@ use crate::drain::DrainTrigger;
 use std::sync::Arc;
 use tracing::{Instrument, debug, info};
 
+use super::metrics::WorkloadDrainResult;
 use super::{Error, WorkloadMessage, metrics::Metrics};
 
 use crate::proxyfactory::ProxyFactory;
@@ -174,16 +175,22 @@ impl WorkloadProxyManagerState {
                     Some(workload_state) => {
                         info!(
                             uid = workload_uid.0,
-                            "pod drain request, sending GOAWAY on inbound HBONE connections and refusing new streams"
+                            "pod drain request, sending GOAWAY on inbound HBONE connections and refusing new streams that opted in"
                         );
                         workload_state.connection_drain.drain();
+                        self.metrics
+                            .record_workload_drain(WorkloadDrainResult::found);
                     }
                     // Not an error: a workload whose proxy has not started (or that is already
                     // gone) has no connections to drain.
-                    None => debug!(
-                        uid = workload_uid.0,
-                        "pod drain request for workload without a running proxy, ignoring"
-                    ),
+                    None => {
+                        debug!(
+                            uid = workload_uid.0,
+                            "pod drain request for workload without a running proxy, ignoring"
+                        );
+                        self.metrics
+                            .record_workload_drain(WorkloadDrainResult::not_found);
+                    }
                 }
                 Ok(())
             }
@@ -776,6 +783,7 @@ mod tests {
             .connection_drain
             .subscribe();
         assert!(later_conn.has_changed().unwrap());
+        assert_eq!(drains(&fixture.metrics, WorkloadDrainResult::found), 1);
         // The proxy keeps running: new connections are still accepted.
         assert_eq!(fixture.metrics.active_proxy_count.get(), 1);
         assert!(state.workload_states().contains_key(&uid(0)));
@@ -799,6 +807,15 @@ mod tests {
             .await
             .unwrap();
         assert!(state.workload_states().is_empty());
+        assert_eq!(drains(&fixture.metrics, WorkloadDrainResult::not_found), 2);
+        assert_eq!(drains(&fixture.metrics, WorkloadDrainResult::found), 0);
         state.drain().await;
+    }
+
+    fn drains(metrics: &Metrics, result: WorkloadDrainResult) -> u64 {
+        metrics
+            .workload_drains
+            .get_or_create(&crate::inpod::metrics::WorkloadDrainLabels { result })
+            .get()
     }
 }

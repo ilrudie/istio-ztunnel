@@ -52,6 +52,13 @@ pub struct Metrics {
     pub crl_policy_rejections: Family<CrlLabels, Counter>,
 
     pub crl_untracked_connections: Family<CrlLabels, Counter>,
+
+    /// New HBONE streams opened on an inbound connection after its workload was drained.
+    pub drain_streams: Family<DrainStreamLabels, Counter>,
+    /// Upstream workloads this node marked draining.
+    pub draining_endpoints_marked: Family<DrainingMarkLabels, Counter>,
+    /// Endpoint selections that a draining endpoint took part in.
+    pub draining_endpoint_selections: Family<DrainingSelectionLabels, Counter>,
 }
 
 #[derive(Clone, Copy, Default, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
@@ -255,6 +262,48 @@ pub struct CrlLabels {
     pub reporter: Reporter,
 }
 
+/// What a draining inbound HBONE connection did with a new stream (CONNECT).
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
+pub enum DrainStreamAction {
+    /// Reset with REFUSED_STREAM: the client opted in, so it retries on another endpoint.
+    refused,
+    /// Served: the client did not opt in, so refusing it could fail the connection.
+    served,
+}
+
+#[derive(Clone, Copy, Hash, Debug, PartialEq, Eq, EncodeLabelSet)]
+pub struct DrainStreamLabels {
+    pub action: DrainStreamAction,
+}
+
+/// How an upstream workload showed it is draining.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
+pub enum DrainingReason {
+    /// It sent a GOAWAY on an outbound HBONE connection.
+    goaway,
+    /// It refused an opted-in CONNECT with REFUSED_STREAM.
+    refused,
+}
+
+#[derive(Clone, Copy, Hash, Debug, PartialEq, Eq, EncodeLabelSet)]
+pub struct DrainingMarkLabels {
+    pub reason: DrainingReason,
+}
+
+/// What endpoint selection did with a candidate that is marked draining.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
+pub enum DrainingSelection {
+    /// Another endpoint was picked instead.
+    skipped,
+    /// It was picked anyway, since nothing else was selectable.
+    fallback,
+}
+
+#[derive(Clone, Copy, Hash, Debug, PartialEq, Eq, EncodeLabelSet)]
+pub struct DrainingSelectionLabels {
+    pub outcome: DrainingSelection,
+}
+
 #[derive(Clone, Hash, Default, Debug, PartialEq, Eq, EncodeLabelSet)]
 pub struct CommonTrafficLabels {
     reporter: Reporter,
@@ -411,6 +460,27 @@ impl Metrics {
             crl_untracked_connections.clone(),
         );
 
+        let drain_streams = Family::default();
+        registry.register(
+            "hbone_drain_streams",
+            "The total number of new HBONE streams opened on an inbound connection to a draining workload, by whether they were refused (the client opted in) or served (unstable)",
+            drain_streams.clone(),
+        );
+
+        let draining_endpoints_marked = Family::default();
+        registry.register(
+            "draining_endpoints_marked",
+            "The total number of times an upstream workload was marked draining, by how it showed it (unstable)",
+            draining_endpoints_marked.clone(),
+        );
+
+        let draining_endpoint_selections = Family::default();
+        registry.register(
+            "draining_endpoint_selections",
+            "The total number of endpoint selections with a draining candidate, by whether it was skipped or picked as a fallback (unstable)",
+            draining_endpoint_selections.clone(),
+        );
+
         Self {
             connection_opens,
             connection_close,
@@ -421,7 +491,28 @@ impl Metrics {
             open_sockets,
             crl_policy_rejections,
             crl_untracked_connections,
+            drain_streams,
+            draining_endpoints_marked,
+            draining_endpoint_selections,
         }
+    }
+
+    pub fn record_drain_stream(&self, action: DrainStreamAction) {
+        self.drain_streams
+            .get_or_create(&DrainStreamLabels { action })
+            .inc();
+    }
+
+    pub fn record_draining_marked(&self, reason: DrainingReason) {
+        self.draining_endpoints_marked
+            .get_or_create(&DrainingMarkLabels { reason })
+            .inc();
+    }
+
+    pub fn record_draining_selection(&self, outcome: DrainingSelection) {
+        self.draining_endpoint_selections
+            .get_or_create(&DrainingSelectionLabels { outcome })
+            .inc();
     }
 
     pub fn record_socket_open(&self, labels: &SocketLabels) {

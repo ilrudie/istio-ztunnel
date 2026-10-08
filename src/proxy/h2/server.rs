@@ -15,6 +15,7 @@
 use crate::config;
 use crate::drain::DrainWatcher;
 use crate::proxy::Error;
+use crate::proxy::metrics::{DrainStreamAction, Metrics};
 use crate::tls::revocation::{self, RevocationHandle};
 use bytes::Bytes;
 use futures_util::FutureExt;
@@ -95,6 +96,14 @@ impl RequestParts for Parts {
     }
 }
 
+/// Lets [`serve_connection`] drain its connection on request.
+pub struct ConnectionDrainHandle {
+    /// Fires when the connection should drain; see [`crate::drain::ConnectionDrain::subscribe`].
+    pub signal: watch::Receiver<()>,
+    /// Records what the drained connection does with new streams.
+    pub metrics: Arc<Metrics>,
+}
+
 /// Serves one HBONE connection until it closes, or is drained or shut down.
 ///
 /// `connection_drain` drains this connection, at once if the workload was already drained when it
@@ -109,7 +118,7 @@ pub async fn serve_connection<S, F, Fut>(
     drain: DrainWatcher,
     mut force_shutdown: watch::Receiver<()>,
     mut revocation: Option<RevocationHandle>,
-    mut connection_drain: Option<watch::Receiver<()>>,
+    mut connection_drain: Option<ConnectionDrainHandle>,
     handler: F,
 ) -> Result<(), Error>
 where
@@ -166,7 +175,7 @@ where
                 if !goaway_sent
                     && connection_drain
                         .as_ref()
-                        .is_some_and(|d| d.has_changed().unwrap_or(false))
+                        .is_some_and(|d| d.signal.has_changed().unwrap_or(false))
                 {
                     debug!("connection drain requested, sending GOAWAY");
                     conn.graceful_shutdown();
@@ -177,10 +186,12 @@ where
                     // Refuse it rather than serve it, so it lands on an endpoint that is staying.
                     debug!("refusing new stream on a draining connection");
                     send.send_reset(h2::Reason::REFUSED_STREAM);
+                    record_drain_stream(&connection_drain, DrainStreamAction::refused);
                     continue;
                 }
                 if goaway_sent {
                     debug!("serving new stream on a draining connection, the peer cannot retry it");
+                    record_drain_stream(&connection_drain, DrainStreamAction::served);
                 }
                 let (request, recv) = request.into_parts();
                 let req = H2Request {
@@ -201,7 +212,7 @@ where
                 conn.abrupt_shutdown(h2::Reason::NO_ERROR);
                 break
             }
-            _ = crate::drain::wait_for_connection_drain(connection_drain.as_mut()), if !goaway_sent => {
+            _ = crate::drain::wait_for_connection_drain(connection_drain.as_mut().map(|d| &mut d.signal)), if !goaway_sent => {
                 // Keep looping: the existing streams keep running, and new ones must be refused.
                 debug!("connection drain requested, sending GOAWAY");
                 conn.graceful_shutdown();
@@ -238,6 +249,15 @@ where
     // Mark we are done with the connection
     drop(drain);
     Ok(())
+}
+
+fn record_drain_stream(
+    connection_drain: &Option<ConnectionDrainHandle>,
+    action: DrainStreamAction,
+) {
+    if let Some(d) = connection_drain {
+        d.metrics.record_drain_stream(action);
+    }
 }
 
 /// Whether the peer marked this CONNECT as safe to refuse while draining.
@@ -352,19 +372,38 @@ mod tests {
         client: h2::client::SendRequest<Bytes>,
         gate: ReadGate,
         server: tokio::task::JoinHandle<Result<(), Error>>,
+        metrics: Arc<Metrics>,
+    }
+
+    fn test_metrics() -> Arc<Metrics> {
+        Arc::new(Metrics::new(
+            &mut prometheus_client::registry::Registry::default(),
+        ))
+    }
+
+    /// How many new streams a draining connection handled with `action`.
+    fn drain_streams(metrics: &Metrics, action: DrainStreamAction) -> u64 {
+        metrics
+            .drain_streams
+            .get_or_create(&crate::proxy::metrics::DrainStreamLabels { action })
+            .get()
     }
 
     /// Serves one connection subscribed to `connection_drain`, and returns a client for it.
     async fn connect(connection_drain: &ConnectionDrain, drain: DrainWatcher) -> Conn {
         let (client_io, server_io) = tokio::io::duplex(1 << 16);
         let (force_tx, force_shutdown) = watch::channel(());
+        let metrics = test_metrics();
         let server = tokio::spawn(serve_connection(
             Arc::new(crate::test_helpers::test_config()),
             server_io,
             drain,
             force_shutdown,
             None,
-            Some(connection_drain.subscribe()),
+            Some(ConnectionDrainHandle {
+                signal: connection_drain.subscribe(),
+                metrics: metrics.clone(),
+            }),
             echo,
         ));
         // Keep force shutdown from firing just because the sender went away.
@@ -381,6 +420,7 @@ mod tests {
             client,
             gate,
             server,
+            metrics,
         }
     }
 
@@ -443,6 +483,8 @@ mod tests {
 
         let err = raced.await.unwrap_err();
         assert_eq!(err.reason(), Some(h2::Reason::REFUSED_STREAM), "{err:?}");
+        assert_eq!(drain_streams(&conn.metrics, DrainStreamAction::refused), 1);
+        assert_eq!(drain_streams(&conn.metrics, DrainStreamAction::served), 0);
         // The client now knows the connection is going away, and opens no more streams on it.
         assert!(conn.client.clone().ready().await.is_err());
 
@@ -514,7 +556,10 @@ mod tests {
                 drain,
                 force_shutdown,
                 None,
-                Some(connection_drain.subscribe()),
+                Some(ConnectionDrainHandle {
+                    signal: connection_drain.subscribe(),
+                    metrics: test_metrics(),
+                }),
                 echo,
             ));
             let err = response.await.unwrap_err();
@@ -550,6 +595,8 @@ mod tests {
         assert_eq!(response.status(), http::StatusCode::OK);
         let mut recv = response.into_body();
         assert_echoes(&mut send, &mut recv, "served").await;
+        assert_eq!(drain_streams(&conn.metrics, DrainStreamAction::served), 1);
+        assert_eq!(drain_streams(&conn.metrics, DrainStreamAction::refused), 0);
         // The GOAWAY still went out, so the client opens nothing more here.
         assert!(conn.client.clone().ready().await.is_err());
 

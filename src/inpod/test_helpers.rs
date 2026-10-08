@@ -199,6 +199,17 @@ pub async fn send_workload_added(
     .expect("failed to sendmsg");
 }
 
+pub async fn send_workload_drain(s: &mut UnixStream, uid: super::WorkloadUid) {
+    let r = WorkloadRequest {
+        payload: Some(crate::inpod::istio::zds::workload_request::Payload::Drain(
+            crate::inpod::istio::zds::DrainWorkload {
+                uid: uid.into_string(),
+            },
+        )),
+    };
+    send_request(s, r).await;
+}
+
 pub async fn send_workload_del(s: &mut UnixStream, uid: super::WorkloadUid) {
     let r = WorkloadRequest {
         payload: Some(crate::inpod::istio::zds::workload_request::Payload::Del(
@@ -207,6 +218,11 @@ pub async fn send_workload_del(s: &mut UnixStream, uid: super::WorkloadUid) {
             },
         )),
     };
+    send_request(s, r).await;
+}
+
+/// Sends a request that carries no file descriptor.
+async fn send_request(s: &mut UnixStream, r: WorkloadRequest) {
     let data: Vec<u8> = r.encode_to_vec();
 
     let iov = [std::io::IoSlice::new(&data[..])];
