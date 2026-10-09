@@ -211,10 +211,10 @@ impl OutboundConnection {
     /// - `Identity` and `WorkloadHBONEPoolDraining`, which fail identically against every
     ///   endpoint: the first is a local certificate fetch, the second is our own shutdown.
     /// - `HttpStatus`, where the peer answered and refused. This carries RBAC denials, and a
-    ///   policy decision does not change on retry. The exception is a 503: the destination ztunnel
-    ///   answers that when it cannot reach the application, typically because the pod is shutting
-    ///   down and the app already exited. It is the CONNECT response, so nothing reached the
-    ///   application and another endpoint can take the connection.
+    ///   policy decision does not change on retry. The exception is any 5xx: the destination
+    ///   failed on its side, most often a 503 because it cannot reach the application (typically
+    ///   the pod is shutting down and the app already exited). It is the CONNECT response, so no
+    ///   data has been sent yet and another endpoint can take the connection.
     /// - `CertificateRevoked`, which is a deliberate security outcome.
     ///
     /// `MaybeHBONENetworkPolicyError` is retried even though its usual cause, a NetworkPolicy
@@ -226,7 +226,7 @@ impl OutboundConnection {
     ///
     /// `HandshakeTimeout` is retried for the same reason, and because the peer accepted the TCP
     /// connection, it is this endpoint that stalled rather than anything blocking the port.
-    fn is_retriable_error(err: &Error) -> bool {
+    fn is_retriable_connection_error(err: &Error) -> bool {
         matches!(
             err,
             // Build: our view of the mesh may not have caught up.
@@ -240,8 +240,7 @@ impl OutboundConnection {
                 | Error::H2(_)
                 | Error::HandshakeTimeout(_)
                 | Error::MaybeHBONENetworkPolicyError(_)
-                | Error::HttpStatus(http::StatusCode::SERVICE_UNAVAILABLE)
-        )
+        ) || matches!(err, Error::HttpStatus(status) if status.is_server_error())
     }
 
     /// The delay before retry number `retry` (1-based): `base` for the first retry, doubling
@@ -270,7 +269,7 @@ impl OutboundConnection {
         max_retries: usize,
         start: Instant,
     ) -> Option<Duration> {
-        if !Self::is_retriable_error(err) || retries >= max_retries {
+        if !Self::is_retriable_connection_error(err) || retries >= max_retries {
             return None;
         }
         let backoff = self.configured_retry_backoff(retries + 1);
@@ -2804,7 +2803,7 @@ mod tests {
 
     #[test]
     fn is_retriable_error_classification() {
-        let retriable = OutboundConnection::is_retriable_error;
+        let retriable = OutboundConnection::is_retriable_connection_error;
         let addr: SocketAddr = "127.0.0.1:80".parse().unwrap();
 
         // Build failures: our view of the mesh may not have caught up yet.
@@ -2847,10 +2846,17 @@ mod tests {
         assert!(!retriable(&Error::HttpStatus(
             http::StatusCode::UNAUTHORIZED
         )));
-        // Except a 503 to the CONNECT: the destination could not reach its application (it is
-        // likely shutting down), and nothing was sent to it, so another endpoint can serve this.
+        // Except a 5xx to the CONNECT: the destination failed on its side (a 503 when it could not
+        // reach its application), and nothing was sent to it, so another endpoint can serve this.
         assert!(retriable(&Error::HttpStatus(
             http::StatusCode::SERVICE_UNAVAILABLE
+        )));
+        assert!(retriable(&Error::HttpStatus(
+            http::StatusCode::INTERNAL_SERVER_ERROR
+        )));
+        assert!(retriable(&Error::HttpStatus(http::StatusCode::BAD_GATEWAY)));
+        assert!(retriable(&Error::HttpStatus(
+            http::StatusCode::GATEWAY_TIMEOUT
         )));
         // A deliberate security outcome, not a flaky endpoint.
         assert!(!retriable(&Error::CertificateRevoked));
@@ -3013,7 +3019,7 @@ mod tests {
             .await
             .expect_err("a service with no endpoints has no upstream");
         assert!(matches!(err, Error::NoHealthyUpstream(_)));
-        assert!(OutboundConnection::is_retriable_error(&err));
+        assert!(OutboundConnection::is_retriable_connection_error(&err));
 
         let start = Instant::now();
         let res = oc
@@ -3229,7 +3235,7 @@ mod tests {
         let refused = Error::H2(h2::Error::from(h2::Reason::REFUSED_STREAM));
         assert!(OutboundConnection::is_drain_refusal(&refused));
         // And it is retried, on another endpoint.
-        assert!(OutboundConnection::is_retriable_error(&refused));
+        assert!(OutboundConnection::is_retriable_connection_error(&refused));
         assert!(!OutboundConnection::is_drain_refusal(&Error::H2(
             h2::Error::from(h2::Reason::INTERNAL_ERROR)
         )));
